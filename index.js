@@ -137,9 +137,9 @@ app.use((err, req, res, next) => {
 
 // ==== تشغيل السيرفر ====
 const PORT = process.env.PORT || 3000;
-const server = app.listen(PORT, () =>
-  console.log(`🚀 الباك إند شغال على http://localhost:${PORT}`),
-);
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`🚀 Server is running on port ${PORT}`);
+});
 
 // ==== SIGINT / Cleanup Handler ====
 const gracefulShutdown = async () => {
