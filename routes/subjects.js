@@ -14,63 +14,31 @@ const prisma = new PrismaClient();
 // ميدلوير التحقق من إدخال المواد (سهل وقوي)
 // =============================================
 const validateSubjectsInput = (req, res, next) => {
-  const { subjects } = req.body;
+  const { subjects, name, prices } = req.body;
 
-  if (!subjects || !Array.isArray(subjects) || subjects.length === 0) {
-    return res.status(400).json({
-      error: "يجب إرسال مصفوفة 'subjects' تحتوي على مادة واحدة على الأقل",
-    });
+  // التحقق في حالة الـ POST (مصفوفة) أو الـ PUT (كائن واحد)
+  const subjectsToValidate = subjects || [{ name, prices }];
+
+  if (!subjectsToValidate[0].name?.trim()) {
+    return res.status(400).json({ error: "اسم المادة مطلوب" });
   }
 
-  for (const [index, subject] of subjects.entries()) {
-    if (!subject.name?.trim()) {
-      return res.status(400).json({
-        error: `اسم المادة مطلوب للمادة رقم ${index + 1}`,
-      });
+  const pricesArray = subjectsToValidate[0].prices;
+  if (!pricesArray || !Array.isArray(pricesArray) || pricesArray.length === 0) {
+    return res.status(400).json({ error: "يجب تحديد أسعار للمادة" });
+  }
+
+  for (const [pIndex, price] of pricesArray.entries()) {
+    if (!price.stage || !["PRIMARY", "MIDDLE", "HIGH"].includes(price.stage)) {
+      return res.status(400).json({ error: `المرحلة غير صالحة في سعر رقم ${pIndex + 1}` });
     }
 
-    if (
-      !subject.prices ||
-      !Array.isArray(subject.prices) ||
-      subject.prices.length === 0
-    ) {
-      return res.status(400).json({
-        error: `يجب تحديد أسعار للمادة "${subject.name}"`,
-      });
+    if (typeof price.price !== "number" || price.price <= 0) {
+      return res.status(400).json({ error: `السعر يجب أن يكون رقم موجب في سعر رقم ${pIndex + 1}` });
     }
 
-    for (const [pIndex, price] of subject.prices.entries()) {
-      if (
-        !price.stage ||
-        !["PRIMARY", "MIDDLE", "HIGH"].includes(price.stage)
-      ) {
-        return res.status(400).json({
-          error: `المرحلة غير صالحة في سعر رقم ${pIndex + 1} للمادة "${subject.name}"`,
-        });
-      }
-
-      if (typeof price.price !== "number" || price.price <= 0) {
-        return res.status(400).json({
-          error: `السعر يجب أن يكون رقم موجب في سعر رقم ${pIndex + 1} للمادة "${subject.name}"`,
-        });
-      }
-
-      if (
-        price.subscriptionType &&
-        !["MONTHLY", "COURSE"].includes(price.subscriptionType)
-      ) {
-        return res.status(400).json({
-          error: `نوع الاشتراك غير صالح في سعر رقم ${pIndex + 1} (MONTHLY أو COURSE فقط)`,
-        });
-      }
-
-      if (price.subscriptionType === "COURSE") {
-        if (!price.durationInMonths || price.durationInMonths < 1) {
-          return res.status(400).json({
-            error: `للكورس يجب تحديد عدد الشهور (durationInMonths) في سعر رقم ${pIndex + 1} للمادة "${subject.name}"`,
-          });
-        }
-      }
+    if (price.subscriptionType && !["MONTHLY", "COURSE", "HALF_MONTH"].includes(price.subscriptionType)) {
+      return res.status(400).json({ error: `نوع الاشتراك غير صالح في سعر رقم ${pIndex + 1}` });
     }
   }
 
@@ -78,7 +46,7 @@ const validateSubjectsInput = (req, res, next) => {
 };
 
 // =============================================
-// POST /api/subjects - إضافة مادة/مواد (محمي)
+// POST /api/subjects - إضافة مادة/مواد
 // =============================================
 router.post(
   "/",
@@ -105,9 +73,10 @@ router.post(
 
         for (const price of sub.prices) {
           const subscriptionType = price.subscriptionType || "MONTHLY";
-          const finalPrice = price.price;
+          // استخدام Math.round لتجنب مشكلة الـ 119 بدل 120
+          const finalPrice = Math.round(price.price);
 
-          // 1️⃣ احفظ السعر الأصلي زي ما هو
+          // 1️⃣ حفظ السعر الأصلي
           await prisma.subjectPrice.create({
             data: {
               subjectId: newSubject.id,
@@ -118,26 +87,20 @@ router.post(
             },
           });
 
-          // 2️⃣ لو النوع MONTHLY → احفظ نسخة نص شهر أوتوماتيك
+          // 2️⃣ لو النوع MONTHLY -> إنشاء نسخة نص شهر تلقائياً
           if (subscriptionType === "MONTHLY") {
             await prisma.subjectPrice.create({
               data: {
                 subjectId: newSubject.id,
                 stage: price.stage,
                 subscriptionType: "HALF_MONTH",
-                price: finalPrice / 2,
-                durationInMonths: price.durationInMonths || null,
+                price: Math.round(finalPrice / 2),
+                durationInMonths: null,
               },
             });
           }
 
-          // حفظ البيانات للرد
-          processedPrices.push({
-            stage: price.stage,
-            subscriptionType,
-            price: finalPrice,
-            durationInMonths: price.durationInMonths || null,
-          });
+          processedPrices.push({ ...price, price: finalPrice });
         }
 
         const subjectWithPrices = await prisma.subject.findUnique({
@@ -145,12 +108,8 @@ router.post(
           include: { prices: true },
         });
 
-        createdSubjects.push({
-          ...subjectWithPrices,
-          processedPrices,
-        });
+        createdSubjects.push(subjectWithPrices);
 
-        // تسجيل في ActivityLog
         await prisma.activityLog.create({
           data: {
             centerId,
@@ -158,10 +117,7 @@ router.post(
             action: "CREATE_SUBJECT",
             targetType: "Subject",
             targetId: newSubject.id,
-            details: JSON.stringify({
-              name: newSubject.name,
-              prices: processedPrices,
-            }),
+            details: JSON.stringify({ name: newSubject.name, prices: processedPrices }),
           },
         });
       }
@@ -172,15 +128,13 @@ router.post(
       });
     } catch (error) {
       console.error("خطأ في إضافة المواد:", error);
-      res
-        .status(500)
-        .json({ error: error.message || "حصل خطأ داخلي في السيرفر" });
+      res.status(500).json({ error: error.message || "حصل خطأ داخلي في السيرفر" });
     }
   }
 );
 
 // =============================================
-// باقي الراوت زي ما هو تمام
+// GET /api/subjects - عرض كل المواد
 // =============================================
 router.get(
   "/",
@@ -190,68 +144,25 @@ router.get(
   async (req, res) => {
     try {
       const { centerId } = req.user;
-
       const subjects = await prisma.subject.findMany({
         where: { centerId },
-        include: {
-          prices: {
-            select: {
-              id: true,
-              stage: true,
-              subscriptionType: true,
-              price: true,
-              activeFrom: true,
-            },
-          },
-        },
+        include: { prices: { orderBy: { stage: "asc" } } },
         orderBy: { name: "asc" },
       });
 
-      res.json({
-        success: true,
-        count: subjects.length,
-        data: subjects,
-      });
+      res.json({ success: true, count: subjects.length, data: subjects });
     } catch (error) {
-      console.error("خطأ في عرض المواد:", error);
       res.status(500).json({ error: "حصل خطأ داخلي في السيرفر" });
     }
   }
 );
 
-router.get(
-  "/:id",
-  authenticateToken,
-  requireActiveSubscription,
-  requireCenterAccess,
-  async (req, res) => {
-    try {
-      const { id } = req.params;
-      const { centerId } = req.user;
-
-      const subject = await prisma.subject.findFirst({
-        where: { id: Number(id), centerId },
-        include: { prices: true },
-      });
-
-      if (!subject) {
-        return res
-          .status(404)
-          .json({ error: "المادة غير موجودة أو لا تتبع سنترك" });
-      }
-
-      res.json({ success: true, subject });
-    } catch (error) {
-      console.error("خطأ في عرض مادة:", error);
-      res.status(500).json({ error: "حصل خطأ داخلي في السيرفر" });
-    }
-  }
-);
-
-// PUT /api/subjects/:id - تعديل مادة
+// =============================================
+// PUT /api/subjects/:id - تعديل مادة (التصحيح الأسطوري هنا)
+// =============================================
 router.put(
   "/:id",
-    authenticateToken,
+  authenticateToken,
   requireActiveSubscription,
   requireRole(["ADMIN"]),
   validateSubjectsInput,
@@ -266,19 +177,16 @@ router.put(
       });
 
       if (!subject) {
-        return res
-          .status(404)
-          .json({ error: "المادة غير موجودة أو لا تتبع سنترك" });
+        return res.status(404).json({ error: "المادة غير موجودة أو لا تتبع سنترك" });
       }
 
-      const dataToUpdate = {};
-      if (name?.trim()) dataToUpdate.name = name.trim();
-
+      // 1. تحديث اسم المادة
       const updatedSubject = await prisma.subject.update({
         where: { id: Number(id) },
-        data: dataToUpdate,
+        data: { name: name.trim() },
       });
 
+      // 2. مسح الأسعار القديمة لإعادة بنائها (نفس لوجيك الـ POST)
       if (prices && Array.isArray(prices)) {
         await prisma.subjectPrice.deleteMany({
           where: { subjectId: Number(id) },
@@ -286,18 +194,30 @@ router.put(
 
         for (const price of prices) {
           const subscriptionType = price.subscriptionType || "MONTHLY";
-          let finalPrice = price.price;
+          const finalPrice = Math.round(price.price);
 
-          if (subscriptionType === "HALF_MONTH") finalPrice = price.price / 2;
-
+          // حفظ السعر الأساسي (التعديل يحترم التقريب الآن)
           await prisma.subjectPrice.create({
             data: {
               subjectId: Number(id),
               stage: price.stage,
               subscriptionType,
               price: finalPrice,
+              durationInMonths: price.durationInMonths || null,
             },
           });
+
+          // إضافة "نص الشهر" تلقائياً لو النوع شهر
+          if (subscriptionType === "MONTHLY") {
+            await prisma.subjectPrice.create({
+              data: {
+                subjectId: Number(id),
+                stage: price.stage,
+                subscriptionType: "HALF_MONTH",
+                price: Math.round(finalPrice / 2),
+              },
+            });
+          }
         }
       }
 
@@ -308,54 +228,50 @@ router.put(
           action: "UPDATE_SUBJECT",
           targetType: "Subject",
           targetId: updatedSubject.id,
-          details: JSON.stringify({
-            updatedFields: Object.keys(dataToUpdate),
-            newPrices: prices,
-          }),
+          details: JSON.stringify({ name: updatedSubject.name, prices }),
         },
       });
 
-      const subjectWithPrices = await prisma.subject.findUnique({
+      const result = await prisma.subject.findUnique({
         where: { id: Number(id) },
         include: { prices: true },
       });
 
-      res.json({
-        message: "تم تعديل المادة بنجاح",
-        subject: subjectWithPrices,
-      });
+      res.json({ message: "تم تعديل المادة بنجاح", subject: result });
     } catch (error) {
       console.error("خطأ في تعديل مادة:", error);
       res.status(500).json({ error: "حصل خطأ داخلي في السيرفر" });
     }
-  },
+  }
 );
 
-// DELETE /api/subjects/:id - حذف مادة (مع حذف كل ما يرتبط بها)
+// =============================================
+// DELETE /api/subjects/:id - حذف مادة
+// =============================================
 router.delete(
   "/:id",
-    authenticateToken,
+  authenticateToken,
   requireActiveSubscription,
   requireRole(["ADMIN"]),
   async (req, res) => {
     try {
       const { id } = req.params;
-      const subjectId = Number(id);
       const { centerId, userId } = req.user;
 
       const subject = await prisma.subject.findFirst({
-        where: { id: subjectId, centerId },
+        where: { id: Number(id), centerId },
       });
 
       if (!subject) {
-        return res
-          .status(404)
-          .json({ error: "المادة غير موجودة أو لا تتبع سنترك" });
+        return res.status(404).json({ error: "المادة غير موجودة" });
       }
 
-      await prisma.subscriptionItem.deleteMany({ where: { subjectId } });
-      await prisma.subjectPrice.deleteMany({ where: { subjectId } });
-      await prisma.subject.delete({ where: { id: subjectId } });
+      // استخدام transaction للحذف النظيف
+      await prisma.$transaction([
+        prisma.subscriptionItem.deleteMany({ where: { subjectId: Number(id) } }),
+        prisma.subjectPrice.deleteMany({ where: { subjectId: Number(id) } }),
+        prisma.subject.delete({ where: { id: Number(id) } }),
+      ]);
 
       await prisma.activityLog.create({
         data: {
@@ -363,24 +279,16 @@ router.delete(
           userId,
           action: "DELETE_SUBJECT",
           targetType: "Subject",
-          targetId: subjectId,
+          targetId: Number(id),
           details: JSON.stringify({ name: subject.name }),
         },
       });
 
-      res.json({
-        message: "تم حذف المادة وكل الاشتراكات والأسعار المرتبطة بها بنجاح",
-      });
+      res.json({ message: "تم حذف المادة والبيانات المرتبطة بها بنجاح" });
     } catch (error) {
-      console.error("خطأ في حذف مادة:", error);
-      if (error.code === "P2003" || error.message.includes("foreign key")) {
-        return res.status(400).json({
-          error: "لا يمكن حذف المادة لوجود بيانات مرتبطة (تم محاولة حذفها)",
-        });
-      }
-      res.status(500).json({ error: "حصل خطأ داخلي في السيرفر" });
+      res.status(500).json({ error: "حصل خطأ في الحذف، قد تكون المادة مرتبطة بسجلات أخرى" });
     }
-  },
+  }
 );
 
 module.exports = router;
