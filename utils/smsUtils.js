@@ -1,105 +1,121 @@
+// backend/utils/smsUtils.js
 const { PrismaClient } = require("@prisma/client");
 
 const prisma = new PrismaClient();
 
+// السعر للعرض في السجلات فقط، الخصم يتم بالوحدة (1)
+const CHARGE_PRICE =
+  parseFloat(process.env.CHARGE_SMS_PRICE_PER_MESSAGE) || 0.23;
+
 /**
- * حساب أجزاء الرسالة (عربي) - 60 حرفاً للجزء الواحد
+ * دالة مساعدة لحساب عدد أجزاء الرسالة بناءً على 60 حرفاً للجزء الواحد
+ * @param {string} text - نص الرسالة
+ * @returns {number} - عدد الأجزاء
  */
 function calculateSmsParts(text) {
   if (!text) return 0;
   const charCount = text.trim().length;
+  // كل 60 حرف = رسالة واحدة، يتم التقريب للأعلى دائماً
   return Math.ceil(charCount / 60);
 }
 
 /**
- * دالة الصبر (الانتظار) - لضمان اكتمال الـ Transactions في قاعدة البيانات
- */
-const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-/**
- * إرسال إشعار SMS تلقائي - نسخة "الصبور القوي"
+ * إرسال إشعار SMS تلقائي ذكي لولي أمر الطالب
  * @param {number|string} studentId - ID الطالب
- * @param {string} eventType - نوع الحدث
+ * @param {string} eventType - FIRST_SUB | ENDING_SOON | EXPIRED | RENEWED
  */
 async function sendAutoSms(studentId, eventType) {
   try {
     const numericId = Number(studentId);
-    if (!numericId || numericId <= 0) return { success: false, reason: "invalid_id" };
-
-    // --- المحاولة الأولى لجلب البيانات بصبر ---
-    let student = await fetchStudentData(numericId);
-
-    // لو مفيش اشتراكات، نصبر 800ms ونحاول تاني (عشان نلحق الـ Transaction اللي بيسيف)
-    if (!student?.subscriptions?.length) {
-      console.log(`[SMS WAIT] جاري الصبر على قاعدة البيانات للطالب ${numericId}...`);
-      await wait(800); 
-      student = await fetchStudentData(numericId);
+    if (isNaN(numericId) || numericId <= 0) {
+      console.warn(`[AUTO SMS] studentId غير صالح: ${studentId}`);
+      return { success: false, reason: "invalid_student_id" };
     }
 
-    // 1. فحص وجود الطالب وهاتفه (شرط أساسي للإرسال)
+    // جلب الطالب مع أحدث اشتراك وبيانات السنتر
+    const student = await prisma.student.findUnique({
+      where: { id: numericId },
+      include: {
+        center: { select: { name: true, id: true } },
+        subscriptions: {
+          orderBy: { createdAt: "desc" },
+          take: 1,
+          include: {
+            items: {
+              include: { subject: { select: { name: true } } },
+            },
+          },
+        },
+      },
+    });
+
     if (!student || !student.phone?.trim()) {
-      console.warn(`[SMS FAIL] الطالب ${numericId} غير موجود أو بدون هاتف.`);
-      return { success: false, reason: "no_student_or_phone" };
+      console.warn(`[AUTO SMS] لا يوجد طالب أو رقم تليفون لـ ID: ${numericId}`);
+      return { success: false, reason: "no_phone" };
     }
 
     const phone = student.phone.trim();
-    const centerName = student.center?.name || "المركز";
-    const lastSub = student.subscriptions?.[0] || null;
+    const centerName = student.center?.name || "المركز التعليمي";
+    const lastSub = student.subscriptions[0];
 
-    // 2. فحص وجود اشتراك (لو مفيش اشتراك خالص حتى بعد الصبر)
-    if (!lastSub) {
-      console.warn(`[SMS FAIL] لا يوجد أي اشتراك مسجل للطالب: ${student.name}`);
-      return { success: false, reason: "no_subscription" };
+    // إذا كان الحدث يتطلب بيانات اشتراك ولم نجد اشتراكاً
+    if (!lastSub && eventType !== "FIRST_SUB") {
+      console.warn(`[AUTO SMS] لا يوجد سجل اشتراك للطالب ${student.name}`);
+      return { success: false, reason: "no_subscription_found" };
     }
 
-    // 3. تجهيز البيانات المالية والزمنية "بكل مرونة" (Safe Access)
-    const totalPrice = lastSub.totalPrice ?? 0;
-    const endDate = lastSub.endDate 
-      ? new Date(lastSub.endDate).toLocaleDateString("ar-EG", { day: 'numeric', month: 'numeric' })
+    // تجهيز بيانات الرسالة المتغيرة
+    const endDateStr = lastSub?.endDate 
+      ? new Date(lastSub.endDate).toLocaleDateString("ar-EG") 
       : "غير محدد";
+    const subType = lastSub?.subscriptionType || "غير محدد";
+    const totalPrice = lastSub?.totalPrice || 0;
 
-    // تحويل قائمة المواد (لو مفيش مواد مش هيطلع ارور، هيكتب لا يوجد)
-    const itemsList = (lastSub.items && lastSub.items.length > 0)
+    const materialsList = lastSub?.items
       ? lastSub.items
-          .map(i => `${i.subject?.name ?? "مادة"}:${i.priceSnapshot ?? 0}ج`)
-          .join(" | ")
-      : "لا يوجد مواد محددة";
+          .map((item) => `• ${item.subject.name} - ${item.priceSnapshot} ج.م`)
+          .join("\n")
+      : "لا توجد مواد محددة";
 
     let message = "";
 
-    // 4. بناء نص الرسالة (تصميم احترافي ومختصر)
-    const studentName = student.name || "طالب";
-    
+    // إنشاء نص الرسالة حسب نوع الحدث
     switch (eventType) {
       case "FIRST_SUB":
-        message = `تم تسجيل ${studentName} بـ ${centerName}\nالمواد: ${itemsList}\nالإجمالي: ${totalPrice}ج\nالانتهاء: ${endDate}`;
+        message = `مرحبًا بك في ${centerName}!\nتم تسجيل ${student.name} بنجاح.\nاشتراكك (${subType}) ينتهي يوم ${endDateStr}.\nالمواد:\n${materialsList}\nالمجموع: ${totalPrice} ج.م`;
         break;
-      case "RENEWED":
-        message = `تم تجديد اشتراك ${studentName} بـ ${centerName}\nالمواد: ${itemsList}\nالإجمالي: ${totalPrice}ج\nالانتهاء: ${endDate}`;
-        break;
+
       case "ENDING_SOON":
-        message = `تنبيه: اشتراك ${studentName} بـ ${centerName} ينتهي ${endDate}\nيرجى التجديد لضمان الاستمرار.`;
+        message = `عزيزي ولي أمر ${student.name}،\nنذكرك بأن اشتراك الطالب في ${centerName} (${subType}) سينتهي بتاريخ ${endDateStr}.\nيرجى التجديد لضمان الاستمرار.`;
         break;
+
       case "EXPIRED":
-        message = `عذراً: انتهى اشتراك ${studentName} بـ ${centerName} (${endDate})\nيرجى مراجعة السنتر للتجديد.`;
+        message = `عزيزي ولي أمر ${student.name}،\nنحيطكم علماً بأن اشتراك السنتر (${centerName}) قد انتهى بتاريخ ${endDateStr}.\nيرجى التجديد لاستئناف الحضور.`;
         break;
+
+      case "RENEWED":
+        message = `تم تجديد اشتراك ${student.name} بنجاح في ${centerName}!\nالاشتراك الجديد (${subType}) ينتهي يوم ${endDateStr}.\nالمواد:\n${materialsList}\nالمجموع: ${totalPrice} ج.م\nشكراً لكم.`;
+        break;
+
       default:
-        console.error(`[SMS FAIL] الحدث ${eventType} غير مدعوم.`);
-        return { success: false, reason: "unsupported_event" };
+        console.warn(`[AUTO SMS] نوع حدث غير معروف: ${eventType}`);
+        return { success: false, reason: "invalid_event_type" };
     }
 
-    // 5. حساب التكلفة والتحقق من المحفظة
+    // --- حساب عدد الأجزاء المطلوبة بناءً على النص النهائي ---
     const requiredParts = calculateSmsParts(message);
+
+    // 1. التحقق من رصيد المحفظة
     const wallet = await prisma.smsWallet.findUnique({
       where: { centerId: student.centerId },
     });
 
     if (!wallet || wallet.balance < requiredParts) {
-      console.error(`[SMS FAIL] رصيد غير كاف لمركز: ${centerName}. متاح: ${wallet?.balance ?? 0}`);
+      console.warn(`[AUTO SMS] رصيد غير كافٍ لمركز ${student.centerId}. المطلوب: ${requiredParts}، المتاح: ${wallet?.balance || 0}`);
       return { success: false, reason: "insufficient_balance" };
     }
 
-    // 6. الخصم وتسجيل المعاملة (Atomic Transaction)
+    // 2. خصم عدد الأجزاء الفعلي وتحديث المحفظة وتسجيل العملية
     await prisma.$transaction([
       prisma.smsWallet.update({
         where: { centerId: student.centerId },
@@ -108,48 +124,31 @@ async function sendAutoSms(studentId, eventType) {
       prisma.smsTransaction.create({
         data: {
           walletId: wallet.id,
-          amount: -requiredParts,
+          amount: -requiredParts, // تسجيل عدد الأجزاء المسحوبة كقيمة سالبة
           type: "SEND",
-          description: `[تلقائي: ${eventType}] - ${studentName} - ${requiredParts} رسالة`,
+          description: `[تلقائي: ${eventType}] - طالب: ${student.name} - أجزاء: ${requiredParts} - هاتف: ${phone}`,
         },
       }),
     ]);
 
-    // 7. لوجز النجاح المبهجة
-    console.log(`\n--- ✅ تم الإرسال بنجاح (نسخة الصبور) ---`);
-    console.log(`📍 ${centerName} -> 👤 ${studentName}`);
-    console.log(`📝 النص: ${message.split('\n')[0]}...`);
-    console.log(`💳 الرصيد الحالي: ${wallet.balance - requiredParts}`);
-    console.log(`----------------------------------------\n`);
+    // 3. تنفيذ الإرسال الفعلي (Log)
+    console.log(`------------------------------------`);
+    console.log(`[SMS SENT AUTO] نوع الحدث: ${eventType}`);
+    console.log(`إلى: ${phone}`);
+    console.log(`عدد الحروف: ${message.length}`);
+    console.log(`عدد الرسائل المحسوبة: ${requiredParts}`);
+    console.log(`الرسالة: ${message}`);
+    console.log(`------------------------------------`);
 
     return { success: true, partsSent: requiredParts };
-
   } catch (error) {
-    console.error(`[CRITICAL SMS ERROR]:`, error.message);
-    return { success: false, reason: "internal_error", error: error.message };
+    console.error(`[AUTO SMS ERROR] تفاصيل الخطأ:`, error.message);
+    return { success: false, reason: "internal_error" };
   }
 }
 
-/**
- * دالة مساعدة لجلب بيانات الطالب مع اشتراكاته (لتجنب التكرار)
- */
-async function fetchStudentData(id) {
-  return await prisma.student.findUnique({
-    where: { id },
-    include: {
-      center: { select: { name: true, id: true } },
-      subscriptions: {
-        orderBy: { createdAt: "desc" },
-        take: 1,
-        include: {
-          items: { include: { subject: { select: { name: true } } } },
-        },
-      },
-    },
-  });
-}
-
-// تنظيف الاتصال عند الإغلاق
-process.on("SIGINT", async () => { await prisma.$disconnect(); });
+// تنظيف الاتصال عند إغلاق السيرفر
+process.on("SIGTERM", async () => await prisma.$disconnect());
+process.on("SIGINT", async () => await prisma.$disconnect());
 
 module.exports = { sendAutoSms };
