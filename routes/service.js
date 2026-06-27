@@ -1,81 +1,33 @@
 const express = require('express');
 const { google } = require('googleapis');
-const fs = require('fs');
-const path = require('path');
 
 const router = express.Router();
 
 // ==========================================
-// ⚙️ مفتاح التحكم الإستراتيجي للمطور
-// ==========================================
-// 💡 اجعلها true إذا كنت تريد إجبار السيرفر على استخدام المفتاح المدمج بالأسفل وتجاهل الملف الخارجي
-const FORCE_EMBEDDED = true; 
-
-// ==========================================
-// 🛠️ إعداد واعتماد مفاتيح الوصول (Authentication Factory)
+// 🔑 إعداد واعتماد مفاتيح الوصول الداخلية (Hardcoded Engine)
 // ==========================================
 
-let googleCredentials = null;
-let authMode = 'NONE';
+const authMode = 'EMBEDDED_HARDCODED_KEYS';
 
-const jsonPath = path.join(__dirname, '..', 'service-account.json');
+// البيانات الجديدة مدمجة كلياً هنا (تم الاستغناء تماماً عن الملفات الخارجية ومتغيرات البيئة)
+const googleCredentials = {
+  client_email: "indexing-bot@sentryk2026.iam.gserviceaccount.com",
+  private_key: `-----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDW97s3giI+BU9W\nBfSEUBxIrLvH56+HCyIQu7XD92zdAwb1MHSLRu43ysuAgbXGDKq6LEqaDCjpREsg\nc4gH9tcR8BVUdhoOMVxsP6RSvI6jSHkcXxRGhfCe0tw7a5J3kI6ppR0h7p8kELqC\n5qoDf/i0vF5PfLQzHWBaqmwyxs0kXlz8M+sTr+QMAtK/nz7mZVXa1E8uzfxEcQ3z\nxhwCPFf0h5SNIueQs+IhqrlYhIFR/6OyBQCSIB2jhVkDy905LoN5K4PPjZLcR0u6\nPRiILYAQNr5kPXYeOHbAEAC3/lZQauS2MnXDJAOEW6VY9dQukLhmQeQKaa/fy83h\nBPUhE6FBAgMBAAECggEAVLd5kRUYcI/AJdsf81rs4pksQcplKtew255WMj4aqXjt\nb4hijZbs/5DMpT65B61rRQZ6ef4ry04uO0I8jELznC6dAVWvzAMY9NIZ7L9BiUjg\n7dTslSRo4Pahc0tgA/20s1eORRaYoepzzm2f99Qhi/ymQDYZgAFmPSTnkhU1uEw8\n5v5Vn+Fw7+lgkbHatDXU6czBSsNr6LLXOR0p7BgeaDUK9oS148/4HgbiW13ZU+Eg\n/J1Ri90QauQr7CPiw7aQuEn04v3KB1f//suI1aXvRoYHIFgRie6dpAxBZTBjOOoV\n+V9InJq/JWSWK54VTFag3ij3gwH4tTVA/SYq8caKJwKBgQDxjuFGQu7UrOjj+qNZ\nFZnpu+tcPA8G8AVHUun+FhEPMKAAxLNebPRzCngsc3Ts17oB11c5Vkl44PWgK+Az\nmennXfd51g3CQZcyNzAMJ2+es+YKQ4G3QQa6OoznxNso5DiGjpdwFklMqyQZF/DP\n533glw7Y+mewGe1pVxT8+RdcWwKBgQDj0eB6KY8uHWCR9WJ2VzHj+ChcDdK7GyHy\noLecZqZ0Y6pUcfjqb02B0HN+kIo328GRNGnPhzjxNgeGNdU5E4lVsEHFKqaVymOB\xb41Kye9hkT2IzWdHSyWIY0saY/qv0U5795I2rVRrmAYzYxYTT1SzGu1OwVOvAL+\n1/FOeYQbkwKBgH0n7oic/Wmr/S7CGgh6LLjx6MxtQcvyaIm/6AUCIeyg4QYE5Hq0\MSO59PHzEE32qCV0EXlfv8mlpR5MHWofARYjlanGwnI30cLu3TIu7KJpy3Ld70On\nqXisBX3AfVz+glsVXllw8qGKurVVtivCYXIQUl0RwM95X40I1ZMM7JGpAoGBAKIJ\nQ8T/zDO7d1U5F+gdyoFfnq0is9Ca0sF0aEPYiunbfWmEisuLkLAVKCBMA9MI/Zse\nkWemwOxnRmDB5z8qUxLcQ1tOI6AEjFPf5pKAeEqHtoLuthJijrTVdkixaEhJ9J3p\nstcq3xGL1lU0U542XYLqUwEh5jhhqvlwV7UdQ77AoGBALNlI2Lh30DJIdPMO93g\nKcqEdHDplWD5GIAh+bGlVqDUCWHYWqkn7Lu/l3+1lBWEMyy0Bt/9mUxPcxGF6QDI\nXQBcAHYnzRtlqmoJ96Y/0tIVHh3hxInpAd0b7kCe2gKWVyGXMrSaTf5C6Dorl9gv\nYXHPmlhLGl8iq0EXYgiWWmxR\n-----END PRIVATE KEY-----\n`.replace(/\\n/g, '\n')
+};
 
-// 1. محاولة القراءة من الملف الخارجي (فقط إذا لم يتم تفعيل الإجبار الخارجي)
-if (!FORCE_EMBEDDED && fs.existsSync(jsonPath)) {
-  try {
-    const rawData = fs.readFileSync(jsonPath, 'utf8');
-    const serviceAccount = JSON.parse(rawData);
-    
-    if (serviceAccount.client_email && serviceAccount.private_key) {
-      // تنظيف المفتاح لضمان عدم وجود تكرار في الهروب (Double Escaping)
-      let cleanedKey = serviceAccount.private_key;
-      if (cleanedKey.includes('\\n')) {
-        cleanedKey = cleanedKey.replace(/\\n/g, '\n');
-      }
-      
-      googleCredentials = {
-        client_email: serviceAccount.client_email,
-        private_key: cleanedKey,
-      };
-      authMode = 'EXTERNAL_JSON_FILE';
-    }
-  } catch (fileError) {
-    console.error(`❌ [Sentryk Indexing Engine]: فشل في تحليل ملف service-account.json الخارجي:`, fileError.message);
-  }
-}
+// بناء عميل المصادقة المحدث Object-based
+let jwtClient = new google.auth.JWT({
+  email: googleCredentials.client_email,
+  key: googleCredentials.private_key,
+  scopes: ['https://www.googleapis.com/auth/indexing']
+});
 
-// 2. البديل الإستراتيجي المدمج: يتم الدخول هنا إذا لم يجد الملف أو إذا تم تفعيل FORCE_EMBEDDED
-if (!googleCredentials) {
-  console.log(`⚠️ [Sentryk Indexing Engine]: جاري الاعتماد على البيانات المدمجة يدويًا بكود السيرفر...`);
-  
-  googleCredentials = {
-    client_email: "indexing-bot@sentryk2026.iam.gserviceaccount.com",
-    private_key: `-----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDNZ4boHt5pmVWB\nIEbJK8QoCQqg6hngCnl83cH12/ztFv6Mopo/xDyOV6Y/1bl67e4PIReAkQjRR8bL\nodC0hzd8LPGoY3K42ye7n7Mbta1YbVi56orT+6kDagfTiIdvB4AMbdQjvTm8Dp6g\nk2+Kdj9QYeTqhSsdSb3D4it/4vKEjuqeUyhwBhCpktIukUss1tdD63thcJWBaZu/\nOW2Q0PpiNtqRDbOcnmHj/sV17xIyaaLwQyk9q1cd77ycuh5LhnUvqMnQ4VC6vaOB\nMjHG4rqhA0YcvHVgdfAqPZt6FqW7bBEVNRdS70rdIZXRaGe79bXIrzhlemRUr9+e\nUEzi0QKDAgMBAAECggEADVxpmxm+7/GIbVDTKezN4qjL5zGzIy6rPmMSZdK8fhOb\n1TwSeoliQwQSjV5ypTtq29MUO0mz4CEiHkbVU5jkFBC8W260nK+swvidZvUHZJQg\nTF+kTiu1j8JK5gigfqlnO+e8/+IkKkZtLRbKD6Cnd6wWfubQqiQM0vwYRkZV7idb\n3T9LlU9s3qXFweZY1JWgzjwNPBSR3lkvV70K/ztlyou1SPP1qNRbLHSl09ax5umc\nXa/qz/JMiKsc1O74HJBUsfBlKO0fTKcbODhlLYrxrq3+WER0uT2no+CH/+x3GCHv\nmmpgfz4g/Y9GFD9ngjkQfMSXns+rUjb30ji0yQx7CQKBgQDyE60s2NNNISvinFqK\nm8ejyGSGGMihSK0A4wEaiiWGlBkTPppG07+aCNbjSJ28eDWwUrzGtCbH/LjdJ+9S\nPoMG2FR7ATefwUd/k61dJkIeZUEhzU3+6y8YfmasVZ+JHD0X1b8uoorb9dNQC9j6\nwq100i6f9ypneTAwzcPE9Okf1QKBgQDZN+M+30J8jCWTSqBHclhwza+0eu5WaTH2\n3Shd0Z7XEufNaFrjGVakvLhpJNGuRFnS1IPkjp2SX96RJWp4uiz4n6+j8e91LTOc\nXyjeHoxcADTmJCVwxXuijb5SBSaFfv53wWnYBHyuGLZdGbk8eXU/87w0D3k8OAVb\nCAFFWMgc9wKBgDIM22tAUT/LMfWieh3aY4Z7cj0/dovSKOLcDGheU6/lguG1udQX\nB7BjT3qikupauE8CbEFxEeubVuVy0kpg3lpV8/GSqNuA7LV15QwzUsxSBwtkFVI1\ncgFQcQ4Ejf2dNwxshyCvPqKHyu7r5CrEgXR72GP+iGfoaIxOnsFkGacZAoGBAMUp\no0zIHXMrSlf9Xqo7MeeB60AobPlmFoH6j89Im6KgeGLLm+OSdkClQ8W8M864H8fs\nOaNVh9T6y+x3R8M5SeSKHUT0LuPvGW+QOGoU1FYVoe5bVNidh/EuM1gDcMmvUY6l\nskrvF7R2neC3npkzradUtrmSafqs5r+P7odhZJJVAoGBAIfQenYpZDzL4dDq9QcA\ndg/cv9peHNY7HK0JYXQpZttEd3NEPcmaKc+KMYMAXN6WpvOrVVrr1v4jIw/+nLPI\nwMgPCD4kc8wkqLY55la+0j3YQCrh04s3U8QOnJTjQAMaP/zL2hfPKFhUF0NMO23y\nP+2Mde20Xy+ytS91rCA1Wt82\n-----END PRIVATE KEY-----\n`.replace(/\\n/g, '\n'),
-  };
-  authMode = 'EMBEDDED_HARDCODED_KEYS';
-}
-
-// 🔑 بناء وتكوين عميل JWT المحدث
-let jwtClient = null;
-
-if (googleCredentials && googleCredentials.client_email && googleCredentials.private_key) {
-  jwtClient = new google.auth.JWT({
-    email: googleCredentials.client_email,
-    key: googleCredentials.private_key,
-    scopes: ['https://www.googleapis.com/auth/indexing']
-  });
-  console.log(`✅ [Sentryk Indexing Engine]: تم تشغيل النظام بنجاح عبر وضع [${authMode}].`);
-} else {
-  console.error(`❌ [Sentryk Indexing Engine]: خطأ حرج! فشل بناء عميل مفاتيح الاعتماد.`);
-}
+console.log(`✅ [Sentryk Indexing Engine]: تم تشغيل المصادقة الداخلية الحصرية بنجاح [${authMode}].`);
 
 /**
- * 🚀 دالة داخلية لإرسال الرابط الواحد لجوجل
+ * 🚀 دالة إرسال الرابط الفردي لجوجل
  */
 async function sendToGoogle(url, type = 'URL_UPDATED') {
-  if (!jwtClient) {
-    throw new Error("لم يتم تهيئة مفاتيح Google API بشكل صحيح على السيرفر.");
-  }
   await jwtClient.authorize();
   const response = await jwtClient.request({
     url: 'https://indexing.googleapis.com/v3/urlNotifications:publish',
@@ -86,7 +38,8 @@ async function sendToGoogle(url, type = 'URL_UPDATED') {
 }
 
 /**
- * 📡 الـ Endpoint الرئيسي
+ * 📡 الـ Endpoint الرئيسي لفهرسة الروابط اللحظية
+ * المسار: POST /api/indexing/request-instant
  */
 router.post('/request-instant', async (req, res) => {
   const { url, urls, type = 'URL_UPDATED' } = req.body;
@@ -102,14 +55,7 @@ router.post('/request-instant', async (req, res) => {
     });
   }
 
-  if (!jwtClient) {
-    return res.status(500).json({ 
-      success: false, 
-      error: "فشل نظام المصادقة الداخلي للسيرفر." 
-    });
-  }
-
-  console.log(`⚡ [Sentryk Indexing Engine]: جاري بدء فهرسة ذكية لعدد (${urlsToProcess.length}) رابط...`);
+  console.log(`⚡ [Sentryk Indexing Engine]: جاري بدء الفهرسة الحصرية لعدد (${urlsToProcess.length}) رابط...`);
 
   const results = [];
   
