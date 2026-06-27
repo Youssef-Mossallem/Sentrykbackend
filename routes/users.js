@@ -5,6 +5,7 @@ const {
   authenticateToken,
   requireRole,
   requireCenterAccess,
+  requireActiveSubscription, // 🚀 تم استدعاء ميدلوير فحص الاشتراك لحقن حدود الخطة تلقائياً
 } = require("../middleware/auth");
 
 const router = express.Router();
@@ -65,17 +66,62 @@ const validateUserInput = (req, res, next) => {
   next();
 };
 
-// POST /api/users - إضافة مستخدم جديد (centerId من التوكن)
+// POST /api/users - إضافة مستخدم جديد (centerId من التوكن + فحص السعة الاستيعابية للباقة)
 router.post(
   "/",
   authenticateToken,
   requireRole(["ADMIN"]),
+  requireActiveSubscription, // 🔐 حماية الطبقة السحابية لضمان حقن كائن req.planLimits
   validateUserInput,
   async (req, res) => {
     try {
       const { name, email, password, role } = req.body;
       const { centerId, userId } = req.user; // ← centerId من التوكن تلقائيًا
 
+      // ======================================================================
+      // 🛑 نظام الفحص الذكي للحد الأقصى للمستشارين والمساعدين (Users Limit Enforcer)
+      // ======================================================================
+      const plan = req.planLimits?.plan || "TRIAL";
+      
+      // 📊 خريطة التكوين الافتراضية لعدد المستخدمين الإضافيين المسموح بهم لكل باقة
+      const USER_PLAN_LIMITS = {
+        TRIAL: 2,      // باقة تجريبية: يتيح مساعدين اثنين فقط بجانب صاحب الحساب
+        BASIC: 5,      // الباقة الأساسية: تتيح 5 مساعدين
+        PRO: 15,       // الباقة الاحترافية: تتيح 15 مساعداً
+        ELITE: 999     // الباقة المفتوحة
+      };
+
+      // اعتماد الحدود المخصصة من قاعدة البيانات إن وجدت، وإلا العودة للحدود الافتراضية للباقة
+      const maxAllowedUsers = req.planLimits?.maxUsersCustom || USER_PLAN_LIMITS[plan] || 2;
+
+      // 🔍 العثور على المستخدم الأول والأقدم في السنتر (صاحب الحساب الأصلي / المالك الرئيسي)
+      const firstUser = await prisma.user.findFirst({
+        where: { centerId },
+        orderBy: { id: "asc" }, // جلب صاحب أقل ID وهو أول حساب تم إنشاؤه للسنتر
+      });
+
+      // 🧮 حساب عدد المستخدمين الحاليين مع استثناء المالك الرئيسي تماماً من الحسبة
+      const currentUsersCount = await prisma.user.count({
+        where: {
+          centerId,
+          id: firstUser ? { not: firstUser.id } : undefined, // 💡 المالك الرئيسي خارج الحسبة ولا يُحتسب في العدد
+        },
+      });
+
+      // 🚨 التحقق من تخطي السعة القصوى للباقة الحالية
+      if (currentUsersCount >= maxAllowedUsers) {
+        return res.status(403).json({
+          error: `⚠️ عذراً، لقد استنفذت الحد الأقصى المسموح به للمساعدين والمشرفين في خطتك الحالية [${plan}] وهو (${maxAllowedUsers} مستخدمين إضافيين).`,
+          limitExceeded: true,
+          resource: "users",
+          maxAllowed: maxAllowedUsers,
+          currentCount: currentUsersCount,
+          suggestion: "يرجى ترقية باقة السنتر الحالية لزيادة سعة الطاقم الإداري والمساعدين المتاحين 🚀",
+        });
+      }
+      // ======================================================================
+
+      // فحص الإيميل الفريد
       const existingUser = await prisma.user.findUnique({ where: { email } });
       if (existingUser) {
         return res.status(409).json({ error: "الإيميل مستخدم من قبل" });

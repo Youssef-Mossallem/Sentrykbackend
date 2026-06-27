@@ -16,12 +16,13 @@ enum Role {
 }
 
 enum Stage {
-  PRIMARY
-  MIDDLE
-  HIGH
+  PRIMARY // ابتدائي
+  MIDDLE  // إعدادي
+  HIGH    // ثانوي
 }
 
 enum SubscriptionType {
+  PER_SESSION
   MONTHLY
   HALF_MONTH
   COURSE
@@ -32,7 +33,7 @@ enum SubscriptionStatus {
   EXPIRED
 }
 
-enum SmsTransactionType {
+enum WhatsAppTransactionType {
   CHARGE
   SEND
 }
@@ -44,199 +45,274 @@ enum PaymentStatus {
   REFUNDED
 }
 
+enum AttendanceStatus {
+  PRESENT
+  ABSENT
+  LATE
+}
+
+enum BillingCycle {
+  MONTHLY
+  YEARLY
+  BOTH
+}
+
 // =============================================
 // MODELS
 // =============================================
 
 model User {
-  id                   Int       @id @default(autoincrement())
-  name                 String
-  email                String    @unique
-  password             String
-  role                 Role
-  centerId             Int
-  isActive             Boolean   @default(true)
-  resetToken           String?
-  resetTokenExpiry     DateTime?
-  createdAt            DateTime  @default(now())
-  updatedAt            DateTime  @updatedAt
-
-  center               Center         @relation(fields: [centerId], references: [id], onDelete: Cascade)
-  activityLogs         ActivityLog[]
+  id               Int            @id @default(autoincrement())
+  name             String
+  email            String         @unique
+  password         String
+  role             Role
+  centerId         Int
+  isActive         Boolean        @default(true)
+  resetToken       String?
+  resetTokenExpiry DateTime?
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
+  center           Center         @relation(fields: [centerId], references: [id], onDelete: Cascade)
+  activityLogs     ActivityLog[]
   createdSubscriptions Subscription[] @relation("CreatedSubscriptions")
-  payments             Payment[]
+  payments         Payment[]
 }
 
 model Center {
   id             Int       @id @default(autoincrement())
   name           String
   phone          String
-
-  plan           String    @default("TRIAL")
+  plan           String    @default("null") // مثل: BASIC, PREMIUM, TRIAL
   trialUsed      Boolean   @default(false)
   trialStartedAt DateTime?
-
-  referralCode   String?   @unique
-  referralCount  Int       @default(0)
+  isActive       Boolean   @default(true)
   createdAt      DateTime  @default(now())
   updatedAt      DateTime  @updatedAt
 
-  users          User[]
-  students       Student[]
-  groups         Group[]
-  subjects       Subject[]
-  activityLogs   ActivityLog[]
-  smsWallet      SmsWallet?
-  subscriptions  CenterSubscription[]
-  payments       Payment[]
+  // 1. حدود نظام الـ SaaS للتحكم الكامل
+  maxStudents Int @default(0) 
+  maxUsers    Int @default(1) 
+
+  // 2. هندسة نظام الإحالة المتطور (Referral System)
+  referralCode  String? @unique 
+  referralCount Int     @default(0) 
+
+  referredById    Int?
+  referredBy      Center?  @relation("CenterReferrals", fields: [referredById], references: [id], onDelete: SetNull)
+  referredCenters Center[] @relation("CenterReferrals")
+
+  referralMilestoneAchieved Boolean @default(false) 
+
+  // 3. 🛡️ نظام تتبع أكواد الخصم المستمرة وإمكانية إيقافها يدوياً للسنتر
+  activePromoCodeId Int? 
+  activePromoCode   PromoCode? @relation("CenterActivePromo", fields: [activePromoCodeId], references: [id], onDelete: SetNull)
+  promoMonthsUsed   Int        @default(0) 
+  promoAppliedAt    DateTime? 
+  isPromoPaused     Boolean    @default(false) // ✨ ميزة التحكم الذكي الجديدة: إيقاف الخصم مؤقتاً لسنتر معين
+
+  // العلاقات العامة للسنتر
+  users             User[]
+  students          Student[]
+  rooms             Room[]
+  teachers          Teacher[]
+  activityLogs      ActivityLog[]
+  whatsappWallet    WhatsAppWallet?
+  subscriptions     CenterSubscription[]
+  payments          Payment[]
+  attendance        Attendance[]
+  monthlyReportLogs MonthlyReportLog[]
+  attendanceScans   AttendanceScan[]
+  shortLinks        ShortLink[]
+  pendingFreeMonths  Int       @default(0)
+  planExpiresAt DateTime?
 }
 
 model Student {
-  id          Int      @id @default(autoincrement())
-  name        String
-  phone       String
-  stage       Stage
-  groupId     Int?
-  centerId    Int
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
-
-  center      Center   @relation(fields: [centerId], references: [id], onDelete: Cascade)
-  group       Group?   @relation(fields: [groupId], references: [id])
-  subscriptions Subscription[]
+  id                Int                @id @default(autoincrement())
+  name              String
+  phone             String
+  stage             String 
+  grade             Int
+  centerId          Int
+  qrToken           String             @unique @default(uuid())
+  createdAt         DateTime           @default(now())
+  updatedAt         DateTime           @updatedAt
+  center            Center             @relation(fields: [centerId], references: [id], onDelete: Cascade)
+  subscriptions     Subscription[]
+  attendance        Attendance[]
+  monthlyReportLogs MonthlyReportLog[]
+  attendanceScans   AttendanceScan[]
+  qrImageUrl        String?
 }
 
-model Group {
-  id             Int      @id @default(autoincrement())
-  name           String
-  centerId       Int
-  parentGroupId  Int?
-  maxStudents    Int?
-  createdAt      DateTime @default(now())
-  updatedAt      DateTime @updatedAt
-
-  center         Center   @relation(fields: [centerId], references: [id], onDelete: Cascade)
-  parentGroup    Group?   @relation("SubGroups", fields: [parentGroupId], references: [id])
-  subGroups      Group[]  @relation("SubGroups")
-  students       Student[]
+model Room {
+  id          Int       @id @default(autoincrement())
+  name        String    
+  maxStudents Int       @default(60)
+  centerId    Int
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  center      Center    @relation(fields: [centerId], references: [id], onDelete: Cascade)
+  sessions    Session[]
 }
 
-model Subject {
-  id          Int      @id @default(autoincrement())
-  name        String
-  centerId    Int
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+model Teacher {
+  id           Int                  @id @default(autoincrement())
+  name         String
+  subject      String
+  phone        String?
+  centerId     Int
+  createdAt    DateTime             @default(now())
+  updatedAt    DateTime             @updatedAt
+  center       Center               @relation(fields: [centerId], references: [id], onDelete: Cascade)
+  sessions     Session[]
+  priceConfigs PriceConfiguration[]
+}
 
-  center      Center   @relation(fields: [centerId], references: [id], onDelete: Cascade)
-  prices      SubjectPrice[]
+model Session {
+  id                Int                       @id @default(autoincrement())
+  name              String
+  teacherId         Int
+  roomId            Int
+  days              String[]
+  startTime         String
+  endTime           String
+  maxStudents       Int
+  stage             Stage
+  grade             Int
+  createdAt         DateTime                  @default(now())
+  updatedAt         DateTime                  @updatedAt
+  teacher           Teacher                   @relation(fields: [teacherId], references: [id], onDelete: Cascade)
+  room              Room                      @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  attendance        Attendance[]
+  attendanceWindows SessionAttendanceWindow[]
   subscriptionItems SubscriptionItem[]
 }
 
-model CenterSubscription {
-  id        Int      @id @default(autoincrement())
-  centerId  Int
-  startDate DateTime @default(now())
-  endDate   DateTime
-  isActive  Boolean  @default(true)
+model PriceConfiguration {
+  id               Int              @id @default(autoincrement())
+  teacherId        Int
+  stage            Stage
+  grades           Int[]
+  subscriptionType SubscriptionType
+  price            Float
+  createdAt        DateTime         @default(now())
+  updatedAt        DateTime         @updatedAt
+  teacher          Teacher          @relation(fields: [teacherId], references: [id], onDelete: Cascade)
+}
 
+model MonthlyReportLog {
+  id           Int      @id @default(autoincrement())
+  studentId    Int
+  centerId     Int
+  month        Int
+  year         Int
+  totalPresent Int
+  totalAbsent  Int
+  totalLate    Int
+  sentAt       DateTime @default(now())
+  status       String
+  student      Student  @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  center       Center   @relation(fields: [centerId], references: [id], onDelete: Cascade)
+
+  @@unique([studentId, month, year])
+  @@index([centerId])
+}
+
+model CenterSubscription {
+  id        Int       @id @default(autoincrement())
+  centerId  Int
+  startDate DateTime  @default(now())
+  endDate   DateTime
+  isActive  Boolean   @default(true)
   payments  Payment[] @relation("SubToPayments")
   center    Center    @relation(fields: [centerId], references: [id], onDelete: Cascade)
 }
 
 model Payment {
-  id                    Int           @id @default(autoincrement())
+  id                    Int                 @id @default(autoincrement())
   centerId              Int
   centerSubscriptionId  Int?
-
+  promoCodeId           Int? 
   amount                Float
   plan                  String?
-
-  paymentMethod         String?       @default("PAYMOB_FLASH")
-
-  transactionId         String?       @unique
-  paymobIntentionId     String?       @unique
-
+  paymentMethod         String?             @default("PAYMOB_FLASH")
+  transactionId         String?             @unique
+  paymobIntentionId     String?             @unique
   merchantReference     String?
-
-  status                PaymentStatus @default(PENDING)
-
+  status                PaymentStatus       @default(PENDING)
   createdBy             Int?
-  createdAt             DateTime      @default(now())
-  updatedAt             DateTime      @updatedAt
+  createdAt             DateTime            @default(now())
+  updatedAt             DateTime            @updatedAt
   paidAt                DateTime?
-
   metadata              Json?
 
-  center               Center              @relation(fields: [centerId], references: [id], onDelete: Cascade)
-  createdByUser        User?               @relation(fields: [createdBy], references: [id])
-  centerSubscription   CenterSubscription? @relation("SubToPayments", fields: [centerSubscriptionId], references: [id])
-  smsTransactions      SmsTransaction[]
-}
+  // ✨ حقول الدورة المحاسبية والأمان الرقمي الجديدة (تمنع التخمين نهائياً)
+  billingCycle          BillingCycle?       // لمعرفة هل الفاتورة شهرياً أم سنوياً بشكل صريح
+  durationMonths        Int                 @default(1) // عدد الشهور المدفوعة للتحقق الإضافي
+  planPrice             Float?              // لتخزين السعر الأصلي للباقة قبل أي خصومات
+  activatedAt           DateTime?           // وقت تفعيل الخدمة الفعلي في نظامك
+  processedAt           DateTime?           // وقت معالجة الـ Webhook النهائي
 
-model SubjectPrice {
-  id               Int              @id @default(autoincrement())
-  subjectId        Int
-  stage            Stage
-  subscriptionType SubscriptionType
-  price            Float
-  durationInMonths Int?
-  activeFrom       DateTime         @default(now())
-  updatedAt        DateTime         @updatedAt
+  // العلاقات
+  center                Center              @relation(fields: [centerId], references: [id], onDelete: Cascade)
+  createdByUser         User?               @relation(fields: [createdBy], references: [id])
+  centerSubscription    CenterSubscription? @relation("SubToPayments", fields: [centerSubscriptionId], references: [id])
+  promoCode             PromoCode?          @relation(fields: [promoCodeId], references: [id], onDelete: SetNull)
+  whatsappTransactions  WhatsAppTransaction[]
 
-  subject          Subject          @relation(fields: [subjectId], references: [id], onDelete: Cascade)
-
-  @@unique([subjectId, stage, subscriptionType])
+  // 🛡️ فهارس أمان وسرعة لمنع حالات التزامن (Race Conditions) أثناء الـ Webhook
+  @@index([merchantReference])
+  @@index([status])
 }
 
 model Subscription {
-  id                Int                @id @default(autoincrement())
-  studentId         Int
-  startDate         DateTime           @default(now())
-  endDate           DateTime
-  status            SubscriptionStatus @default(ACTIVE)
-  totalPrice        Float
-  subscriptionType  SubscriptionType
-  createdBy         Int?
-  createdAt         DateTime           @default(now())
-  updatedAt         DateTime           @updatedAt
-
-  student           Student            @relation(fields: [studentId], references: [id], onDelete: Cascade)
-  createdByUser     User?              @relation("CreatedSubscriptions", fields: [createdBy], references: [id])
-  items             SubscriptionItem[]
+  id               Int                @id @default(autoincrement())
+  studentId        Int
+  startDate        DateTime           @default(now())
+  endDate          DateTime
+  status           SubscriptionStatus @default(ACTIVE)
+  totalPrice       Float
+  subscriptionType SubscriptionType
+  createdBy        Int?
+  createdAt        DateTime           @default(now())
+  updatedAt        DateTime           @updatedAt
+  student          Student            @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  createdByUser    User?              @relation("CreatedSubscriptions", fields: [createdBy], references: [id])
+  items            SubscriptionItem[]
 }
 
 model SubscriptionItem {
   id             Int          @id @default(autoincrement())
   subscriptionId Int
-  subjectId      Int
+  sessionId      Int
   priceSnapshot  Float
-
   subscription   Subscription @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
-  subject        Subject      @relation(fields: [subjectId], references: [id])
+  session        Session      @relation(fields: [sessionId], references: [id])
+
+  @@unique([subscriptionId, sessionId])
 }
 
-model SmsWallet {
-  id        Int      @id @default(autoincrement())
-  centerId  Int      @unique
-  balance   Int      @default(0)
-  updatedAt DateTime @updatedAt
-
-  center    Center   @relation(fields: [centerId], references: [id], onDelete: Cascade)
-  transactions SmsTransaction[]
+model WhatsAppWallet {
+  id           Int                 @id @default(autoincrement())
+  centerId     Int                 @unique
+  balance      Int                 @default(0)
+  updatedAt    DateTime            @updatedAt
+  center       Center              @relation(fields: [centerId], references: [id], onDelete: Cascade)
+  transactions WhatsAppTransaction[]
 }
 
-model SmsTransaction {
-  id          Int                @id @default(autoincrement())
+model WhatsAppTransaction {
+  id          Int                     @id @default(autoincrement())
   walletId    Int
   amount      Int
-  type        SmsTransactionType
+  type        WhatsAppTransactionType
   description String?
   paymentId   Int?
-  createdAt   DateTime           @default(now())
-
-  wallet      SmsWallet          @relation(fields: [walletId], references: [id], onDelete: Cascade)
-  payment     Payment?           @relation(fields: [paymentId], references: [id])
+  createdAt   DateTime                @default(now())
+  wallet      WhatsAppWallet          @relation(fields: [walletId], references: [id], onDelete: Cascade)
+  payment     Payment?                @relation(fields: [paymentId], references: [id])
 }
 
 model ActivityLog {
@@ -248,7 +324,107 @@ model ActivityLog {
   targetId    Int?
   details     String?
   createdAt   DateTime @default(now())
-
   center      Center   @relation(fields: [centerId], references: [id], onDelete: Cascade)
   user        User     @relation(fields: [userId], references: [id])
+}
+
+model Attendance {
+  id             Int                      @id @default(autoincrement())
+  studentId      Int
+  sessionId      Int
+  centerId       Int
+  status         AttendanceStatus
+  scannedAt      DateTime?
+  markedAt       DateTime                 @default(now())
+  autoMarked     Boolean                  @default(false)
+  markedBySystem Boolean                  @default(false)
+  lateMinutes    Int?
+  windowId       Int?
+  student        Student                  @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  session        Session                  @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  center         Center                   @relation(fields: [centerId], references: [id], onDelete: Cascade)
+  window         SessionAttendanceWindow? @relation(fields: [windowId], references: [id])
+
+  @@unique([studentId, windowId])
+  @@index([sessionId])
+  @@index([status])
+}
+
+model SessionAttendanceWindow {
+  id               Int          @id @default(autoincrement())
+  sessionId        Int
+  date             DateTime
+  openedAt         DateTime?
+  closedAt         DateTime?
+  isClosed         Boolean      @default(false)
+  autoCloseMinutes Int          @default(10)
+  manualClosedBy   Int?
+  session          Session      @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  attendance       Attendance[]
+
+  @@unique([sessionId, date])
+  @@index([date])
+  @@index([isClosed])
+}
+
+model AttendanceScan {
+  id        Int      @id @default(autoincrement())
+  studentId Int
+  centerId  Int
+  scannedAt DateTime @default(now())
+  student   Student  @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  center    Center   @relation(fields: [centerId], references: [id], onDelete: Cascade)
+
+  @@index([studentId])
+  @@index([centerId])
+  @@index([scannedAt])
+}
+
+model ShortLink {
+  id          Int      @id @default(autoincrement())
+  slug        String   @unique
+  longUrl     String   @db.Text
+  clicks      Int      @default(0)
+  centerId    Int
+  description String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  center      Center   @relation(fields: [centerId], references: [id], onDelete: Cascade)
+
+  @@index([slug])
+  @@index([centerId])
+}
+
+model PromoCode {
+  id              Int          @id @default(autoincrement())
+  code            String       @unique 
+  discountPercent Float 
+  durationMonths  Int          @default(1) 
+  applicableCycle BillingCycle @default(BOTH) 
+  maxUses         Int          @default(100) 
+  usedCount       Int          @default(0) 
+  expiresAt       DateTime 
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+
+  payments      Payment[] 
+  activeCenters Center[]  @relation("CenterActivePromo") 
+
+  @@index([code])
+}
+
+model SuperAdminGateway {
+  id        Int      @id @default(autoincrement())
+  token     String   @unique 
+  isUsed    Boolean  @default(false)
+  expiresAt DateTime 
+  createdAt DateTime @default(now())
+}
+
+model SystemConfig {
+  id               Int      @id @default(autoincrement())
+  ownerName        String 
+  masterPassphrase String 
+  totpSecret       String? 
+  updatedAt        DateTime @updatedAt
 }

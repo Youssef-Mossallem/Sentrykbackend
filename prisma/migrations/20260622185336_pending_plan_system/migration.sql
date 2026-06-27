@@ -1,0 +1,4 @@
+-- AlterTable
+ALTER TABLE "Center" ALTER COLUMN "plan" SET DEFAULT 'null',
+ALTER COLUMN "maxStudents" SET DEFAULT 0,
+ALTER COLUMN "maxUsers" SET DEFAULT 1;

@@ -1,224 +1,1247 @@
 const express = require("express");
+const axios = require("axios");
 const { PrismaClient } = require("@prisma/client");
+const crypto = require("crypto");
+const QRCode = require("qrcode");
+const cloudinary = require("cloudinary").v2;
+const { createCanvas, loadImage } = require("canvas");
+const fs = require("fs");
+const path = require("path");
+const { nanoid } = require("nanoid"); // 🌟 المحرك السري لتوليد الـ Slugs الفريدة والمكثفة
+
 const {
   authenticateToken,
   requireRole,
   requireCenterAccess,
   requireActiveSubscription,
+  checkMaxLimit,
 } = require("../middleware/auth");
 
-const { sendAutoSms } = require("../utils/smsUtils");
+const { sendAutoWhatsApp } = require("../utils/whatsappUtils");
 
 const router = express.Router();
 const prisma = new PrismaClient();
 
 // =============================================
-// ميدلوير التحقق من الإدخال
+// Cloudinary Config
 // =============================================
-const validateStudentInput = (req, res, next) => {
-  const { name, phone, stage, subscriptions } = req.body;
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+});
 
-  if (!name?.trim() || !phone?.trim()) {
-    return res.status(400).json({ error: "اسم الطالب ورقم التليفون مطلوبين" });
-  }
+// =============================================
+// Helpers & Configurations
+// =============================================
+const ALLOWED_STAGES = ["PRIMARY", "MIDDLE", "HIGH"];
+const ALLOWED_SUBSCRIPTION_TYPES = [
+  "PER_SESSION",
+  "MONTHLY",
+  "HALF_MONTH",
+  "COURSE",
+];
 
-  if (!stage || !["PRIMARY", "MIDDLE", "HIGH"].includes(stage)) {
-    return res
-      .status(400)
-      .json({ error: "المرحلة غير صالحة (PRIMARY, MIDDLE, HIGH فقط)" });
-  }
-
-  if (subscriptions && !Array.isArray(subscriptions)) {
-    return res.status(400).json({ error: "subscriptions يجب أن تكون مصفوفة" });
-  }
-
-  next();
+// ثوابت الألوان المأخوذة من إعدادات Tailwind لتصميم الكارت الدارك الاحترافي
+const BRAND_COLORS = {
+  bg: "#030712", // أسود عميق جداً (dark.bg)
+  card: "#0f172a", // لون الكروت الداخلي (dark.card)
+  border: "#1e293b", // لون الحدود والخطوط الدقيقة (dark.border)
+  primary: "#3b82f6", // الأزرق الأساسي المضيء (primary.500)
+  textMain: "#ffffff", // النص الأبيض الأساسي
+  textMuted: "#94a3b8", // النص الرمادي الفرعي
 };
 
-// دالة مساعدة لحساب تاريخ النهاية تلقائيًا (تم تعديلها لضبط نهاية اليوم)
-const calculateEndDate = (subscriptionType, durationInMonths = 1) => {
-  const end = new Date();
-  // ضبط الوقت ليكون نهاية اليوم 23:59:59 لضمان الاستفادة من اليوم كاملاً
-  end.setHours(23, 59, 59, 999);
+/**
+ * دالة مساعدة لرفع البافر (Buffer) مباشرة إلى Cloudinary عبر مسارات تدفق البيانات Streams
+ */
+function uploadBufferToCloudinary(buffer, options) {
+  return new Promise((resolve, reject) => {
+    console.log(
+      "⏳ [Cloudinary Stream]: جاري فتح مسار تدفق البيانات لرفع بافر الصورة...",
+    );
+    const uploadStream = cloudinary.uploader.upload_stream(
+      options,
+      (error, result) => {
+        if (error) {
+          console.error(
+            "❌ [Cloudinary Stream Error]: تفجر الرفع السحابي عبر التدفق:",
+            error.message,
+          );
+          return reject(error);
+        }
+        console.log(
+          "✅ [Cloudinary Stream Success]: تمت عملية الرفع السحابي بنجاح ميكانيكي.",
+        );
+        resolve(result);
+      },
+    );
+    uploadStream.end(buffer);
+  });
+}
 
-  if (subscriptionType === "MONTHLY") end.setMonth(end.getMonth() + 1);
-  else if (subscriptionType === "HALF_MONTH") end.setDate(end.getDate() + 15);
-  else if (subscriptionType === "COURSE")
-    end.setMonth(end.getMonth() + durationInMonths);
+/**
+ * 👑 محرك تقصير الروابط الداخلي الفخم واللحظي لمنظومة Sentryk
+ * توليد كود فريد (Slug) وحفظه برابط Cloudinary الأصلي مقترناً بمعرف السنتر (Multi-Tenancy)
+ */
+async function generateSentrykShortUrl(longUrl, centerId = null) {
+  console.log(
+    `🔗 [Sentryk Shortener]: محاولة توليد رابط قصير للرابط الطويل: ${longUrl}`,
+  );
+  if (!longUrl || !String(longUrl).startsWith("http")) {
+    console.warn(
+      "⚠️ [Sentryk Shortener]: الرابط الطويل غير صالح أو فارغ. تم إلغاء التقصير.",
+    );
+    return longUrl || "";
+  }
+
+  try {
+    if (!centerId) {
+      console.warn(
+        "⚠️ [Sentryk Shortener]: تم استدعاء دالة التقصير بدون تمرير centerId. سيتم إرجاع الرابط الأصلي.",
+      );
+      return longUrl;
+    }
+
+    const slug = nanoid(12);
+    console.log(
+      `⚙️ [Sentryk Shortener]: تم توليد الـ Slug الفريد بنجاح: [${slug}]. جاري الحفظ في الـ DB...`,
+    );
+
+    await prisma.shortLink.create({
+      data: {
+        slug: slug,
+        longUrl: longUrl,
+        centerId: Number(centerId),
+        description: "رابط كارت حضور ذكي موحد ومولد تلقائياً للطالب",
+      },
+    });
+
+    const baseUrl = process.env.BACKEND_URL || "https://sentryk.com";
+    const finalShortUrl = `${baseUrl}/l/${slug}`;
+    console.log(
+      `✅ [Sentryk Shortener Success]: تم تسجيل وتفعيل الرابط المختصر الشغال: ${finalShortUrl}`,
+    );
+    return finalShortUrl;
+  } catch (error) {
+    console.error(
+      "❌ [Sentryk Custom Shortener Critical Error]: تفجر نظام تقصير الروابط المخصص:",
+      error.message,
+    );
+    return longUrl;
+  }
+}
+
+const isValidSubscriptionType = (value) =>
+  ALLOWED_SUBSCRIPTION_TYPES.includes(String(value || "").toUpperCase());
+const normalizeStage = (value) =>
+  String(value || "")
+    .toUpperCase()
+    .trim();
+
+const calculateEndDate = (
+  subscriptionType,
+  durationInMonths = 1,
+  baseDate = new Date(),
+) => {
+  const end = new Date(baseDate);
+  end.setHours(23, 59, 59, 999);
+  const type = String(subscriptionType || "").toUpperCase();
+  console.log(
+    `📅 [Date Engine]: حساب تاريخ انتهاء الصلاحية لنوع [${type}] بدءاً من [${baseDate.toISOString()}]`,
+  );
+
+  switch (type) {
+    case "HALF_MONTH":
+      end.setDate(end.getDate() + 15);
+      break;
+    case "COURSE":
+      end.setMonth(end.getMonth() + (Number(durationInMonths) || 3));
+      break;
+    case "PER_SESSION":
+      end.setDate(end.getDate() + 1);
+      break;
+    case "MONTHLY":
+    default:
+      end.setMonth(end.getMonth() + 1);
+      break;
+  }
+  console.log(
+    `📅 [Date Engine Success]: تاريخ الانتهاء المحسوب بدقة هو: ${end.toISOString()}`,
+  );
   return end;
 };
 
-// دالة لمعالجة حالة الطالب برمجياً (The Magic Part)
-const mapStudentStatus = (student) => {
-  const now = new Date();
+const getMatchingPriceConfig = (
+  teacher,
+  studentStage,
+  studentGrade,
+  subscriptionType,
+) => {
+  const stage = normalizeStage(studentStage);
+  const type = String(subscriptionType || "").toUpperCase();
+  const grade = Number(studentGrade);
 
-  // تحديث حالة كل اشتراك بناءً على التاريخ الحالي
-  const updatedSubscriptions = student.subscriptions.map((sub) => {
-    const isExpired = new Date(sub.endDate) < now;
-    return {
-      ...sub,
-      status: isExpired ? "EXPIRED" : sub.status, // تحويل الحالة لحظياً لو الوقت انتهى
-    };
-  });
-
-  // الطالب يعتبر نشط فقط لو عنده اشتراك واحد على الأقل مش منتهي
-  const hasActiveSub = updatedSubscriptions.some(
-    (sub) => sub.status === "ACTIVE",
+  console.log(
+    `🔍 [Price Configuration Matching]: جاري مطابقة الأسعار للمدرس [${teacher?.name || "غير معروف"}] | المرحلة: ${stage} | الصف: ${grade} | نوع الاشتراك: ${type}`,
   );
 
+  const configs = Array.isArray(teacher?.priceConfigs)
+    ? teacher.priceConfigs
+    : [];
+
+  const directMatch = configs.find((cfg) => {
+    const cfgStage = normalizeStage(cfg.stage);
+    const cfgType = String(cfg.subscriptionType || "").toUpperCase();
+    const grades = Array.isArray(cfg.grades) ? cfg.grades : [];
+    return cfgStage === stage && cfgType === type && grades.includes(grade);
+  });
+
+  if (directMatch) {
+    console.log(
+      `🎯 [Price Match Found]: تم العثور على تطابق سعر مباشر وصريح بقيمة: ${directMatch.price} ج.م`,
+    );
+    return directMatch;
+  }
+
+  if (type === "HALF_MONTH") {
+    console.log(
+      "ℹ️ [Price Match fallback]: لم يتم العثور على تهيئة نصف شهرية مباشرة. جاري محاولة الاشتقاق الهيكلي من الباقة الشهرية (القسمة على 2)...",
+    );
+    const monthlyMatch = configs.find((cfg) => {
+      const cfgStage = normalizeStage(cfg.stage);
+      const cfgType = String(cfg.subscriptionType || "").toUpperCase();
+      const grades = Array.isArray(cfg.grades) ? cfg.grades : [];
+      return (
+        cfgStage === stage && cfgType === "MONTHLY" && grades.includes(grade)
+      );
+    });
+
+    if (monthlyMatch) {
+      const derivedPrice = Math.round(Number(monthlyMatch.price) / 2);
+      console.log(
+        `🎯 [Price Match Derived]: تم اشتقاق السعر النصف شهري بنجاح بقيمة: ${derivedPrice} ج.م بناءً على السعر الشهري ${monthlyMatch.price}`,
+      );
+      return {
+        ...monthlyMatch,
+        price: derivedPrice,
+        subscriptionType: "HALF_MONTH",
+      };
+    }
+  }
+
+  console.warn(
+    "⚠️ [Price Match Mismatch]: فشل العثور على أي تهيئة سعرية متطابقة لهذا الكومبو الأكاديمي!",
+  );
+  return null;
+};
+
+const formatSessionForStudent = (item) => {
+  const session = item?.session || null;
+  const teacher = session?.teacher || null;
   return {
-    ...student,
-    subscriptions: updatedSubscriptions,
-    computedStatus: hasActiveSub ? "ACTIVE" : "EXPIRED",
+    id: item.id,
+    sessionId: item.sessionId,
+    sessionName: session?.name || "مجموعة غير محددة",
+    sessionSubject: teacher?.subject || null,
+    teacher: teacher
+      ? { id: teacher.id, name: teacher.name, subject: teacher.subject }
+      : null,
+    room: session?.room
+      ? { id: session.room.id, name: session.room.name }
+      : null,
+    priceSnapshot: item.priceSnapshot,
   };
 };
 
+/**
+ * 🎯 الـ Mapper الذكي المسؤول عن صياغة بيانات الطالب للفرونت إند
+ */
+const mapStudentStatus = (student) => {
+  if (!student) return null;
+  const now = new Date();
+  const safeSubscriptions = Array.isArray(student.subscriptions)
+    ? student.subscriptions
+    : [];
+
+  const updatedSubscriptions = safeSubscriptions.map((sub) => {
+    const endDate = sub.endDate ? new Date(sub.endDate) : null;
+    const isExpired = endDate ? endDate < now : true;
+    return {
+      id: sub.id,
+      startDate: sub.startDate,
+      endDate: sub.endDate,
+      subscriptionType: sub.subscriptionType,
+      totalPrice: sub.totalPrice,
+      status: isExpired || sub.status === "EXPIRED" ? "EXPIRED" : "ACTIVE",
+      enrolledSessions: Array.isArray(sub.items)
+        ? sub.items.map((item) => formatSessionForStudent(item))
+        : [],
+    };
+  });
+
+  return {
+    id: student.id,
+    name: student.name,
+    phone: student.phone,
+    stage: student.stage,
+    grade: student.grade,
+    qrToken: student.qrToken,
+    qrImageUrl: student.qrImageUrl, // ✨ تم الإصلاح الجذري هنا: الآن الرابط يمرر للفرونت-إند في كل طلبات الـ GET والـ POST تلقائياً
+    createdAt: student.createdAt,
+    updatedAt: student.updatedAt,
+    subscriptions: updatedSubscriptions,
+    computedStatus: updatedSubscriptions.some((sub) => sub.status === "ACTIVE")
+      ? "ACTIVE"
+      : "EXPIRED",
+  };
+};
+
+async function safeSendWhatsApp(studentId, type, payload = {}) {
+  console.log(
+    `📩 [WhatsApp Notification Trigger]: محاولة إرسال رسالة آلية للطالب رقم [${studentId}] من نوع [${type}]`,
+  );
+  try {
+    if (typeof sendAutoWhatsApp === "function") {
+      await sendAutoWhatsApp(studentId, type, payload);
+      console.log(
+        `📩 [WHATSAPP NOTIFICATION SENT] تم إرسال رسالة الترحيب والـ QR بنجاح للطالب ID: ${studentId}`,
+      );
+    } else {
+      console.warn(
+        "⚠️ [WhatsApp Notification Bypass]: دالة sendAutoWhatsApp غير موجودة أو لم يتم استيرادها بشكل صحيح.",
+      );
+    }
+  } catch (error) {
+    console.error(
+      `❌ [STUDENT ROUTE WHATSAPP ERROR] فشل إرسال إشعار الواتساب للطالب رقم ${studentId}:`,
+      error.message,
+    );
+  }
+}
+
 // =============================================
-// POST /api/students - إضافة طالب + اشتراكات
+// المحرك المعماري لرسم الكارت الذكي (Sentryk Elite Canvas QR Designer)
 // =============================================
+async function generateSentrykEliteCard({ studentName, centerName, qrToken }) {
+  console.log(
+    `🎨 [Canvas Designer]: بدء رسم كارت الحضور النخبوي الفخم للطالب: [${studentName}]...`,
+  );
+  const width = 550;
+  const height = 720;
+  const canvas = createCanvas(width, height);
+  const ctx = canvas.getContext("2d");
+
+  ctx.fillStyle = BRAND_COLORS.bg;
+  ctx.fillRect(0, 0, width, height);
+
+  const cardMargin = 25;
+  const cardWidth = width - cardMargin * 2;
+  const cardHeight = height - cardMargin * 2;
+  const radius = 24;
+
+  ctx.save();
+  ctx.fillStyle = BRAND_COLORS.card;
+  ctx.strokeStyle = BRAND_COLORS.border;
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.roundRect(cardMargin, cardMargin, cardWidth, cardHeight, radius);
+  ctx.fill();
+  ctx.stroke();
+  ctx.restore();
+
+  ctx.save();
+  let gradient = ctx.createRadialGradient(
+    width / 2,
+    height / 2,
+    50,
+    width / 2,
+    height / 2,
+    300,
+  );
+  gradient.addColorStop(0, "rgba(59, 130, 246, 0.08)");
+  gradient.addColorStop(1, "rgba(0, 0, 0, 0)");
+  ctx.fillStyle = gradient;
+  ctx.fillRect(cardMargin, cardMargin, cardWidth, cardHeight);
+  ctx.restore();
+
+  ctx.save();
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+
+  const fontStack = '"Readex Pro", "Segoe UI", "Arial", sans-serif';
+
+  ctx.fillStyle = BRAND_COLORS.primary;
+  ctx.font = `bold 24px ${fontStack}`;
+  ctx.fillText(centerName || "المركز التعليمي المشترك", width / 2, 75);
+
+  ctx.fillStyle = BRAND_COLORS.textMuted;
+  ctx.font = `14px ${fontStack}`;
+  ctx.fillText("بـطـاقـة الـحـضـور الـذكـيـة • SENTRYK", width / 2, 110);
+  ctx.restore();
+
+  ctx.save();
+  ctx.strokeStyle = BRAND_COLORS.border;
+  ctx.lineWidth = 1;
+  ctx.setLineDash([5, 5]);
+  ctx.beginPath();
+  ctx.moveTo(cardMargin + 30, 140);
+  ctx.lineTo(width - cardMargin - 30, 140);
+  ctx.stroke();
+  ctx.restore();
+
+  const qrSize = 300;
+  const qrX = (width - qrSize) / 2;
+  const qrY = 180;
+
+  console.log(
+    `🔮 [Canvas Designer - QR Generator]: جاري إنتاج كتل الـ QR Code للتوكن: ${qrToken}`,
+  );
+  const qrRawData = QRCode.create(qrToken, { errorCorrectionLevel: "H" });
+  const modules = qrRawData.modules;
+  const moduleCount = modules.size;
+  const cellSize = qrSize / moduleCount;
+
+  ctx.save();
+  ctx.strokeStyle = "rgba(59, 130, 246, 0.4)";
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.roundRect(qrX - 15, qrY - 15, qrSize + 30, qrSize + 30, 16);
+  ctx.stroke();
+  ctx.restore();
+
+  ctx.save();
+  for (let r = 0; r < moduleCount; r++) {
+    for (let c = 0; c < moduleCount; c++) {
+      const centerStart = Math.floor(moduleCount / 2) - 3;
+      const centerEnd = Math.floor(moduleCount / 2) + 3;
+      if (
+        r >= centerStart &&
+        r <= centerEnd &&
+        c >= centerStart &&
+        c <= centerEnd
+      ) {
+        continue;
+      }
+
+      if (modules.get(r, c)) {
+        const xPos = qrX + c * cellSize;
+        const yPos = qrY + r * cellSize;
+
+        const isFinderPattern =
+          (r < 7 && c < 7) ||
+          (r < 7 && c >= moduleCount - 7) ||
+          (r >= moduleCount - 7 && c < 7);
+
+        if (isFinderPattern) {
+          ctx.fillStyle = BRAND_COLORS.primary;
+          ctx.fillRect(xPos, yPos, cellSize, cellSize);
+        } else {
+          ctx.fillStyle = "rgba(255, 255, 255, 0.9)";
+          ctx.beginPath();
+          ctx.arc(
+            xPos + cellSize / 2,
+            yPos + cellSize / 2,
+            cellSize * 0.38,
+            0,
+            Math.PI * 2,
+          );
+          ctx.fill();
+        }
+      }
+    }
+  }
+  ctx.restore();
+
+  ctx.save();
+  const logoSize = 60;
+  const logoX = qrX + (qrSize - logoSize) / 2;
+  const logoY = qrY + (qrSize - logoSize) / 2;
+
+  ctx.fillStyle = BRAND_COLORS.card;
+  ctx.strokeStyle = BRAND_COLORS.primary;
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(
+    logoX + logoSize / 2,
+    logoY + logoSize / 2,
+    logoSize / 2 + 4,
+    0,
+    Math.PI * 2,
+  );
+  ctx.fill();
+  ctx.stroke();
+
+  const logoPath = path.join(process.cwd(), "public", "assets", "logo.png");
+
+  if (fs.existsSync(logoPath)) {
+    try {
+      const logoImg = await loadImage(logoPath);
+      ctx.beginPath();
+      ctx.arc(
+        logoX + logoSize / 2,
+        logoY + logoSize / 2,
+        logoSize / 2 + 2,
+        0,
+        Math.PI * 2,
+      );
+      ctx.clip();
+      ctx.drawImage(logoImg, logoX, logoY, logoSize, logoSize);
+    } catch (logoErr) {
+      console.error(
+        "⚠️ [Canvas Logo Load Error]: فشل تحميل اللوجو الرسومي، جاري الانتقال للبديل النصي السريع:",
+        logoErr.message,
+      );
+      renderFallbackLogo(ctx, logoX, logoSize, logoY);
+    }
+  } else {
+    renderFallbackLogo(ctx, logoX, logoSize, logoY);
+  }
+  ctx.restore();
+
+  ctx.save();
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+
+  ctx.fillStyle = BRAND_COLORS.textMain;
+  ctx.font = `bold 26px ${fontStack}`;
+  ctx.fillText(studentName, width / 2, 535);
+
+  ctx.fillStyle = BRAND_COLORS.textMuted;
+  ctx.font = `15px ${fontStack}`;
+  ctx.fillText(`كود الهوية الرقمية: ${qrToken}`, width / 2, 580);
+
+  ctx.fillStyle = "rgba(59, 130, 246, 0.15)";
+  ctx.beginPath();
+  ctx.roundRect(cardMargin + 40, 620, cardWidth - 80, 45, 12);
+  ctx.fill();
+
+  ctx.fillStyle = BRAND_COLORS.primary;
+  ctx.font = `600 14px ${fontStack}`;
+  ctx.fillText(
+    "يرجى إبراز الكارت للمساعد عند بوابات القاعات لتسجيل الحضور اللحظي",
+    width / 2,
+    642,
+  );
+  ctx.restore();
+
+  console.log(
+    `✅ [Canvas Designer Success]: تم الفراغ من رسم بافر الكارت بالكامل بنجاح للطالب: ${studentName}`,
+  );
+  return canvas.toBuffer("image/png");
+}
+
+function renderFallbackLogo(ctx, logoX, logoSize, logoY) {
+  ctx.fillStyle = BRAND_COLORS.primary;
+  ctx.beginPath();
+  ctx.arc(
+    logoX + logoSize / 2,
+    logoY + logoSize / 2,
+    logoSize / 3,
+    0,
+    Math.PI * 2,
+  );
+  ctx.fill();
+  ctx.fillStyle = "#ffffff";
+  ctx.font = "bold 20px sans-serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText("S", logoX + logoSize / 2, logoY + logoSize / 2);
+}
+
+// =============================================
+// Validation Middlewares
+// =============================================
+const validateStudentCreateInput = (req, res, next) => {
+  const { name, phone, stage, grade } = req.body;
+  console.log("📥 [Validator]: فحص الحقول الأساسية لطلب إنشاء الطالب...");
+  if (!name || !phone || !stage || grade === undefined) {
+    console.warn(
+      "⚠️ [Validator Mismatch]: حقول مفقودة في الطلب المرسل:",
+      req.body,
+    );
+    return res
+      .status(400)
+      .json({
+        error:
+          "جميع الحقول الأساسية مطلوبة (الاسم، الهاتف، المرحلة، السنة الدراسية)",
+      });
+  }
+  if (!ALLOWED_STAGES.includes(String(stage).toUpperCase().trim())) {
+    console.warn(
+      `⚠️ [Validator Mismatch]: مرحلة دراسية غير مسموح بها نظاماً: [${stage}]`,
+    );
+    return res
+      .status(400)
+      .json({ error: "المرحلة الدراسية المرسلة غير صالحة" });
+  }
+  if (isNaN(Number(grade))) {
+    console.warn(
+      `⚠️ [Validator Mismatch]: السنة الدراسية ليست رقماً صالحاً: [${grade}]`,
+    );
+    return res
+      .status(400)
+      .json({ error: "السنة الدراسية يجب أن تكون رقمًا صحيحًا" });
+  }
+  console.log("✅ [Validator Success]: تخطي مرحلة فحص المدخلات بنجاح تام.");
+  next();
+};
+
+// =============================================
+// Routes Handlers
+// =============================================
+
+// 1) إضافة طالب جديد وتوليد كارت الـ QR الاحترافي الجديد مع الحفظ التلقائي في قاعدة البيانات للـ Link
 router.post(
   "/",
   authenticateToken,
   requireActiveSubscription,
   requireRole(["ADMIN", "SECRETARY"]),
   requireCenterAccess,
-  validateStudentInput,
+  validateStudentCreateInput,
+  checkMaxLimit,
   async (req, res) => {
+    console.log(
+      "🚀 [Route POST /]: استقبال طلب إنشاء طالب فردي جديد وحقنه بالمعاملة البرمجية...",
+    );
     try {
-      const { name, phone, stage, groupId, subscriptions } = req.body;
-      const { centerId, userId } = req.user;
+      const {
+        name,
+        phone,
+        stage,
+        grade,
+        subscriptions,
+        qrToken: customQrToken,
+        isOfflineMode,
+        offlineCreatedAt,
+      } = req.body;
 
-      const result = await prisma.$transaction(async (tx) => {
+      const { centerId, userId } = req.user;
+      const normalizedStage = normalizeStage(stage);
+      const numericGrade = Number(grade);
+
+      const studentCreationDate =
+        isOfflineMode && offlineCreatedAt
+          ? new Date(offlineCreatedAt)
+          : new Date();
+      const finalQrToken =
+        customQrToken?.trim() ||
+        `STU-${crypto.randomBytes(8).toString("hex").toUpperCase()}`;
+
+      console.log(
+        `⚙️ [Route POST / Config]: السنتر ID: ${centerId} | المنشئ ID: ${userId} | الـ QR المعتمد للعملية: ${finalQrToken}`,
+      );
+
+      // جلب اسم السنتر مسبقاً لاستخدامه في رسم الكارت دون تعطيل المعاملة
+      const currentCenter = await prisma.center.findUnique({
+        where: { id: centerId },
+        select: { name: true },
+      });
+      const targetCenterName = currentCenter?.name || "المركز التعليمي الحالي";
+
+      // تنفيذ الخطوات الحرجة في قاعدة البيانات داخل سياق Transaction معزول
+      console.log(
+        "⛓️ [Prisma Transaction]: بدء المعاملة المتسلسلة لإنشاء الطالب واشتراكاته...",
+      );
+      const transactionResult = await prisma.$transaction(async (tx) => {
+        // التحقق الاستباقي الصارم من عدم تكرار التوكن لمنع أخطاء الـ Unique constraint
+        const existingTokenStudent = await tx.student.findUnique({
+          where: { qrToken: finalQrToken },
+        });
+        if (existingTokenStudent) {
+          throw new Error(
+            `رمز التوكن الرقمي [${finalQrToken}] محجوز مسبقاً لطالب آخر بالنظام`,
+          );
+        }
+
+        console.log(
+          `📝 [Transaction - Step 1]: جاري إدراج سجل كائن الطالب الرئيسي باسم: ${name}`,
+        );
         const newStudent = await tx.student.create({
           data: {
             name: name.trim(),
             phone: phone.trim(),
-            stage,
-            groupId: groupId ? Number(groupId) : null,
+            stage: normalizedStage,
+            grade: numericGrade,
+            centerId: centerId,
+            qrToken: finalQrToken,
+            createdAt: studentCreationDate,
+          },
+        });
+        console.log(
+          `🔹 [Transaction - Step 1 Success]: تم إنشاء الطالب بنجاح وحصل على معرف رقمي ID: ${newStudent.id}`,
+        );
+
+        let createdSubscriptionIds = [];
+        if (
+          subscriptions &&
+          Array.isArray(subscriptions) &&
+          subscriptions.length > 0
+        ) {
+          console.log(
+            `📝 [Transaction - Step 2]: جاري معالجة الاشتراكات المضمنة لربط المجموعات التعليمية عدد: ${subscriptions.length}`,
+          );
+
+          for (const sub of subscriptions) {
+            const { subscriptionType, items } = sub;
+            if (!isValidSubscriptionType(subscriptionType)) {
+              throw new Error(
+                `نوع باقة الاشتراك المرسل غير مدعوم بالنظام: [${subscriptionType}]`,
+              );
+            }
+
+            let totalPrice = 0;
+            let itemsToCreate = [];
+
+            if (items && Array.isArray(items)) {
+              for (const item of items) {
+                const { sessionId } = item;
+                console.log(
+                  `🔍 [Transaction - sub-loop]: جاري فحص والتحقق من وجود المجموعة رقم: ${sessionId}`,
+                );
+
+                const sessionData = await tx.session.findUnique({
+                  where: { id: Number(sessionId) },
+                  include: { teacher: { include: { priceConfigs: true } } },
+                });
+
+                if (!sessionData) {
+                  throw new Error(
+                    `المجموعة التعليمية المطلوبة بالرقم [${sessionId}] غير موجودة بالسيستم كلياً`,
+                  );
+                }
+
+                // مطابقة واشتقاق السعر من إعدادات المدرس
+                const priceConfig = getMatchingPriceConfig(
+                  sessionData.teacher,
+                  normalizedStage,
+                  numericGrade,
+                  subscriptionType,
+                );
+
+                if (!priceConfig) {
+                  throw new Error(
+                    `فشل التسجيل: لا توجد فئة سعرية مهيأة للمدرس [${sessionData.teacher?.name || "غير محدد"}] تطابق المرحلة والصف ونوع الاشتراك الحالي لهذه المجموعة.`,
+                  );
+                }
+
+                totalPrice += Number(priceConfig.price);
+                itemsToCreate.push({
+                  sessionId: Number(sessionId),
+                  priceSnapshot: Number(priceConfig.price),
+                });
+              }
+            }
+
+            const endDate = calculateEndDate(
+              subscriptionType,
+              1,
+              studentCreationDate,
+            );
+            console.log(
+              `📝 [Transaction - sub-loop]: جاري إدراج باقة اشتراك الطالب بقيمة إجمالية: ${totalPrice} ج.م`,
+            );
+
+            const newSubscription = await tx.subscription.create({
+              data: {
+                studentId: newStudent.id,
+                subscriptionType: subscriptionType.toUpperCase(),
+                totalPrice: totalPrice,
+                endDate: endDate,
+                status: "ACTIVE",
+                createdBy: userId,
+                createdAt: studentCreationDate,
+                items: { create: itemsToCreate },
+              },
+            });
+            createdSubscriptionIds.push(newSubscription.id);
+          }
+        }
+
+        console.log(
+          "📝 [Transaction - Step 3]: جاري تدوين السجلات الأمنية في لوج النشاطات العام...",
+        );
+        await tx.activityLog.create({
+          data: {
             centerId,
+            userId,
+            action: isOfflineMode ? "SYNC_OFFLINE_STUDENT" : "CREATE_STUDENT",
+            targetType: "Student",
+            targetId: newStudent.id,
+            createdAt: studentCreationDate,
+            details: JSON.stringify({
+              name: newStudent.name,
+              isOfflineSync: !!isOfflineMode,
+              subscriptionsCount: createdSubscriptionIds.length,
+            }),
           },
         });
 
-        let createdSubscriptions = [];
+        // إرجاع البيانات الهامة للخارج لمرحلة معالجة الميديا والرفع
+        return { studentId: newStudent.id, studentName: newStudent.name };
+      });
 
-        if (subscriptions?.length > 0) {
-          for (const sub of subscriptions) {
-            const subscriptionType = sub.subscriptionType;
+      console.log(
+        "✅ [Prisma Transaction Success]: تم إغلاق وتثبيت المعاملة بنجاح كامل في الداتابيز.",
+      );
 
-            // جلب مدة الكورس لو النوع كورس
-            let durationInMonths = 1;
-            if (subscriptionType === "COURSE") {
-              const coursePrice = await tx.subjectPrice.findFirst({
-                where: {
-                  subjectId: Number(sub.items[0].subjectId),
-                  stage,
-                  subscriptionType: "COURSE",
-                },
-              });
-              durationInMonths = coursePrice?.durationInMonths || 1;
-            }
+      // مرحلة رسم الكارت و الرفع السحابي المحصن بالكامل لمنع أي توقف أو فشل حاصر للطلب
+      let qrImageUrl = null;
+      let shortQrUrl = null;
 
-            const startDate = new Date();
-            const endDate = calculateEndDate(
-              subscriptionType,
-              durationInMonths,
-            );
+      try {
+        console.log(
+          "🎨 [Media Phase]: البدء الفوري في محرك توليد وتصميم كارت الهوية النخبوي...",
+        );
+        const cardBuffer = await generateSentrykEliteCard({
+          studentName: transactionResult.studentName,
+          centerName: targetCenterName,
+          qrToken: finalQrToken,
+        });
 
-            // حساب السعر الإجمالي وتجهيز المواد
-            let totalPrice = 0;
-            const itemsToCreate = [];
+        if (process.env.CLOUDINARY_CLOUD_NAME) {
+          console.log(
+            "☁️ [Cloudinary Phase]: جاري رفع كارت الطالب لـ Cloudinary...",
+          );
+          const uploadResult = await uploadBufferToCloudinary(cardBuffer, {
+            folder: `sentryk/center_${centerId}/qrcodes`,
+            public_id: `card_${finalQrToken}`,
+            overwrite: true,
+          });
 
-            for (const item of sub.items) {
-              const priceRecord = await tx.subjectPrice.findUnique({
-                where: {
-                  subjectId_stage_subscriptionType: {
-                    subjectId: Number(item.subjectId),
-                    stage,
-                    subscriptionType,
-                  },
-                },
-              });
+          qrImageUrl = uploadResult.secure_url;
+          console.log(
+            `☁️ [Cloudinary Phase Success]: الرابط المباشر المستقر: ${qrImageUrl}`,
+          );
 
-              let finalPrice = priceRecord?.price || 0;
+          // تمرير الرابط المباشر لمحرك التقصير السيادي الخاص بـ Sentryk
+          shortQrUrl = await generateSentrykShortUrl(qrImageUrl, centerId);
 
-              // Fallback لنصف الشهر
-              if (!priceRecord && subscriptionType === "HALF_MONTH") {
-                const monthly = await tx.subjectPrice.findUnique({
-                  where: {
-                    subjectId_stage_subscriptionType: {
-                      subjectId: Number(item.subjectId),
-                      stage,
-                      subscriptionType: "MONTHLY",
+          const finalSavedUrl = shortQrUrl || qrImageUrl;
+          console.log(
+            `⚙️ [Database Update]: جاري حفظ رابط الكارت المعتمد [${finalSavedUrl}] في ملف الطالب رقم [${transactionResult.studentId}]`,
+          );
+
+          await prisma.student.update({
+            where: { id: transactionResult.studentId },
+            data: { qrImageUrl: finalSavedUrl },
+          });
+          console.log(
+            "✅ [Database Update Success]: تم دمج الرابط المظلي بالملف بنجاح.",
+          );
+        } else {
+          console.warn(
+            "⚠️ [Cloudinary Configuration Missing]: متغيرات البيئة لـ Cloudinary غائبة، تم تجاوز الرفع السحابي.",
+          );
+        }
+      } catch (mediaError) {
+        console.error(
+          "❌ [Isolated Media Phase Error]: حدث فشل أثناء توليد الكارت أو رفعه، لكن تم عزل الخطأ لسلامة التسجيل:",
+          mediaError.message,
+        );
+        // لا يتم إلقاء خطأ هنا، الطالب تم حفظه بالفعل في الداتابيز بنجاح نظامي
+      }
+
+      // إرسال الإشعار الترحيبي والـ QR عبر خطافات الواتساب غير الحاصرة
+      const finalUrlToWhatsApp = shortQrUrl || qrImageUrl || "";
+      if (finalUrlToWhatsApp) {
+        await safeSendWhatsApp(transactionResult.studentId, "FIRST_SUB", {
+          qrImageUrl: finalUrlToWhatsApp,
+        });
+      }
+
+      // جلب كائن الطالب كاملاً مع ملحقاته وعلاقاته لإعادته للفرونت إند متطابق 100% مع الـ Mapper
+      console.log(
+        "🔄 [Final Fetch]: سحب ملف الطالب المحدث كلياً من قاعدة البيانات لإرساله للاستجابة...",
+      );
+      const completeCreatedStudent = await prisma.student.findUnique({
+        where: { id: transactionResult.studentId },
+        include: {
+          subscriptions: {
+            include: {
+              items: {
+                include: {
+                  session: {
+                    include: {
+                      teacher: true,
+                      room: true,
                     },
                   },
-                });
-                if (monthly) finalPrice = monthly.price / 2;
-              }
-
-              totalPrice += finalPrice;
-              itemsToCreate.push({
-                subjectId: Number(item.subjectId),
-                priceSnapshot: finalPrice,
-              });
-            }
-
-            const newSub = await tx.subscription.create({
-              data: {
-                studentId: newStudent.id,
-                startDate,
-                endDate,
-                subscriptionType,
-                totalPrice,
-                status: "ACTIVE",
-                createdBy: userId,
-                items: {
-                  create: itemsToCreate,
                 },
               },
-            });
-            createdSubscriptions.push(newSub);
-          }
-        }
-        return { newStudent, createdSubscriptions };
+            },
+          },
+        },
       });
 
-      await sendAutoSms(result.newStudent.id, "FIRST_SUB");
-
-      res.status(201).json({
-        message: "تم إضافة الطالب بنجاح",
-        student: result.newStudent,
+      console.log(
+        `✨ [API Response Sent]: تم إرسال كود النجاح 21. تم إنشاء الطالب [${transactionResult.studentName}] بنجاح نخبوي ميكانيكي.`,
+      );
+      return res.status(201).json({
+        success: true,
+        message: "تم تسجيل الطالب وتوليد كارت الحضور الذكي بنجاح تام 🚀",
+        student: mapStudentStatus(completeCreatedStudent),
       });
     } catch (error) {
-      res.status(500).json({ error: error.message });
+      console.error(
+        "❌ [Sentryk Student Create Critical Error]: انهار مسار تسجيل الطالب الفردي كلياً. التفاصيل الفنية المكتشفة 👇",
+      );
+      console.error(error);
+      return res.status(500).json({
+        success: false,
+        error:
+          "فشل إتمام عملية تسجيل الطالب نظراً لوجود تعارض في البيانات أو إعدادات السعر",
+        details: error.message,
+      });
     }
   },
 );
 
-// =============================================
-// GET /api/students - عرض الطلاب (مع تحديث الحالة اللحظي)
-// =============================================
+// 1.5) مزامنة الدفعة المجمعة المتقدمة من الطلاب أوفلاين (Bulk Synchronization Mode)
+router.post(
+  "/bulk-sync",
+  authenticateToken,
+  requireActiveSubscription,
+  requireRole(["ADMIN", "SECRETARY"]),
+  requireCenterAccess,
+  async (req, res) => {
+    console.log(
+      "📥 [Bulk Sync Engine]: استلام دفعة مجمعة جديدة للمزامنة الهيكلية في الخلفية...",
+    );
+    try {
+      const { students: studentsArray } = req.body;
+      if (!studentsArray || !Array.isArray(studentsArray)) {
+        console.warn(
+          "⚠️ [Bulk Sync Engine]: البيانات المرسلة لا تطابق مصفوفة صالحة",
+        );
+        return res
+          .status(400)
+          .json({ error: "يجب إرسال مصفوفة طلاب صالحة تحت مفتاح 'students'" });
+      }
+
+      const { centerId, userId } = req.user;
+
+      const currentCenter = await prisma.center.findUnique({
+        where: { id: centerId },
+        select: { name: true },
+      });
+      const targetCenterName = currentCenter?.name || "المركز التعليمي الحالي";
+
+      const syncSummary = { succeeded: [], failed: [] };
+      console.log(
+        `⚙️ [Bulk Sync Engine]: جاري معالجة مصفوفة تحتوي على [${studentsArray.length}] طالب...`,
+      );
+
+      for (const studentData of studentsArray) {
+        try {
+          const {
+            name,
+            phone,
+            stage,
+            grade,
+            subscriptions,
+            qrToken,
+            offlineCreatedAt,
+          } = studentData;
+
+          if (
+            !name?.trim() ||
+            !phone?.trim() ||
+            !stage ||
+            grade === undefined
+          ) {
+            throw new Error(
+              "بيانات الطالب الأساسية غير مكتملة أو تحتوي على قيم فارغة",
+            );
+          }
+
+          const normalizedStage = normalizeStage(stage);
+          const numericGrade = Number(grade);
+          const studentCreationDate = offlineCreatedAt
+            ? new Date(offlineCreatedAt)
+            : new Date();
+          const finalQrToken =
+            qrToken?.trim() ||
+            `STU-${crypto.randomBytes(8).toString("hex").toUpperCase()}`;
+
+          // معالجة كل طالب على حدة في معاملة منفصلة معزولة حتى لا تنهار كامل الدفعة في حال خطأ طالب واحد
+          const syncRecord = await prisma.$transaction(async (tx) => {
+            const tokenConflict = await tx.student.findUnique({
+              where: { qrToken: finalQrToken },
+            });
+            if (tokenConflict) {
+              throw new Error(
+                `رمز التوكن الـ QR [${finalQrToken}] مستخدم بالفعل مسبقاً بطالب آخر`,
+              );
+            }
+
+            const newStudent = await tx.student.create({
+              data: {
+                name: name.trim(),
+                phone: phone.trim(),
+                stage: normalizedStage,
+                grade: numericGrade,
+                centerId: centerId,
+                qrToken: finalQrToken,
+                createdAt: studentCreationDate,
+              },
+            });
+
+            if (subscriptions && Array.isArray(subscriptions)) {
+              for (const sub of subscriptions) {
+                const { subscriptionType, items } = sub;
+                let totalPrice = 0;
+                let itemsToCreate = [];
+
+                if (items && Array.isArray(items)) {
+                  for (const item of items) {
+                    const { sessionId } = item;
+                    const sessionData = await tx.session.findUnique({
+                      where: { id: Number(sessionId) },
+                      include: {
+                        teacher: { include: { priceConfigs: true } },
+                      },
+                    });
+
+                    if (!sessionData) continue;
+
+                    const priceConfig = getMatchingPriceConfig(
+                      sessionData.teacher,
+                      normalizedStage,
+                      numericGrade,
+                      subscriptionType,
+                    );
+
+                    if (priceConfig) {
+                      totalPrice += Number(priceConfig.price);
+                      itemsToCreate.push({
+                        sessionId: Number(sessionId),
+                        priceSnapshot: Number(priceConfig.price),
+                      });
+                    }
+                  }
+                }
+
+                await tx.subscription.create({
+                  data: {
+                    studentId: newStudent.id,
+                    subscriptionType: subscriptionType.toUpperCase(),
+                    totalPrice: totalPrice,
+                    endDate: calculateEndDate(
+                      subscriptionType,
+                      1,
+                      studentCreationDate,
+                    ),
+                    status: "ACTIVE",
+                    createdBy: userId,
+                    createdAt: studentCreationDate,
+                    items: { create: itemsToCreate },
+                  },
+                });
+              }
+            }
+
+            await tx.activityLog.create({
+              data: {
+                centerId,
+                userId,
+                action: "SYNC_OFFLINE_STUDENT",
+                targetType: "Student",
+                targetId: newStudent.id,
+                createdAt: studentCreationDate,
+                details: JSON.stringify({
+                  name: newStudent.name,
+                  isOfflineSync: true,
+                }),
+              },
+            });
+
+            return newStudent;
+          });
+
+          // ترحيل عمليات معالجة الميديا والرفع السحابي للخلفية فوراً عبر الـ Microtasks للتسريع الزمني الفائق
+          setImmediate(() => {
+            console.log(
+              `⏳ [Background Worker]: جاري رسم ومعالجة بطاقة الطالب المزامَن [${syncRecord.name}]...`,
+            );
+            generateSentrykEliteCard({
+              studentName: syncRecord.name,
+              centerName: targetCenterName,
+              qrToken: finalQrToken,
+            })
+              .then(async (cardBuffer) => {
+                let savedUrl = null;
+                if (process.env.CLOUDINARY_CLOUD_NAME) {
+                  const uploadResult = await uploadBufferToCloudinary(
+                    cardBuffer,
+                    {
+                      folder: `sentryk/center_${centerId}/qrcodes`,
+                      public_id: `card_${finalQrToken}`,
+                      overwrite: true,
+                    },
+                  );
+                  savedUrl = uploadResult.secure_url;
+                  const shortUrl = await generateSentrykShortUrl(
+                    savedUrl,
+                    centerId,
+                  );
+                  savedUrl = shortUrl || savedUrl;
+
+                  await prisma.student
+                    .update({
+                      where: { id: syncRecord.id },
+                      data: { qrImageUrl: savedUrl },
+                    })
+                    .catch((e) =>
+                      console.error("❌ Bulk Sync DB Update Error:", e.message),
+                    );
+                }
+                await safeSendWhatsApp(syncRecord.id, "FIRST_SUB", {
+                  qrImageUrl: savedUrl,
+                });
+              })
+              .catch((err) =>
+                console.error(
+                  "❌ Bulk Sync Background Drawing Exception:",
+                  err.message,
+                ),
+              );
+          });
+
+          syncSummary.succeeded.push({
+            id: syncRecord.id,
+            name: syncRecord.name,
+            qrToken: finalQrToken,
+          });
+        } catch (singleError) {
+          console.error(
+            `⚠️ [Bulk Sync Single Failure]: تخطي ومعالجة الخطأ للطالب الفاشل:`,
+            singleError.message,
+          );
+          syncSummary.failed.push({
+            name: studentData?.name || "اسم غير متوفر",
+            error: singleError.message,
+          });
+        }
+      }
+
+      console.log(
+        `🏁 [Bulk Sync Complete Summary]: نجاح مزامنة [${syncSummary.succeeded.length}] طلاب، وفشل [${syncSummary.failed.length}]`,
+      );
+      return res.json({
+        success: true,
+        message: "تمت معالجة دفعة الطلاب ومزامنتها بنجاح نظامي",
+        summary: syncSummary,
+      });
+    } catch (error) {
+      console.error("❌ Bulk Sync Root Critical Error:", error);
+      return res.status(500).json({
+        error: "فشل إتمام معالجة الدفعة المجمعة كلياً بالسيرفر",
+        details: error.message,
+      });
+    }
+  },
+);
+
+// 2) جلب جميع الطلاب مع الفلترة المتقدمة والبحث والـ Pagination المشروط السريع
 router.get(
   "/",
   authenticateToken,
-  requireActiveSubscription,
+  requireRole(["ADMIN", "SECRETARY"]),
   requireCenterAccess,
   async (req, res) => {
+    console.log(
+      "🔍 [Route GET /]: بدء سحب قائمة الطلاب وتطبيق الفلاتر والبحث اللحظي المتقدم...",
+    );
     try {
+      const {
+        page = 1,
+        limit = 10,
+        search,
+        stage,
+        grade,
+        status,
+        sessionId,
+      } = req.query;
       const { centerId } = req.user;
-      const { name, stage, page = 1, limit = 20 } = req.query;
 
-      const where = { centerId };
-      if (name) where.name = { contains: name.trim(), mode: "insensitive" };
-      if (stage) where.stage = stage;
+      const where = { centerId: Number(centerId) };
+      console.log(
+        `⚙️ [Filter Query Engine]: بناء كائن الاستعلام للسنتر رقم [${centerId}]`,
+      );
 
-      const [students, total] = await Promise.all([
+      if (search?.trim()) {
+        where.OR = [
+          { name: { contains: search.trim(), mode: "insensitive" } },
+          { phone: { contains: search.trim() } },
+          { qrToken: { contains: search.trim() } },
+        ];
+      }
+
+      if (stage) {
+        where.stage = normalizeStage(stage);
+      }
+
+      if (grade !== undefined && grade !== "") {
+        where.grade = Number(grade);
+      }
+
+      if (sessionId) {
+        where.subscriptions = {
+          some: {
+            items: {
+              some: {
+                sessionId: Number(sessionId),
+              },
+            },
+          },
+        };
+      }
+
+      if (status) {
+        const now = new Date();
+        if (String(status).toUpperCase() === "ACTIVE") {
+          where.subscriptions = {
+            some: {
+              status: "ACTIVE",
+              endDate: { gte: now },
+              ...(sessionId
+                ? { items: { some: { sessionId: Number(sessionId) } } }
+                : {}),
+            },
+          };
+        } else if (String(status).toUpperCase() === "EXPIRED") {
+          where.subscriptions = {
+            none: {
+              status: "ACTIVE",
+              endDate: { gte: now },
+            },
+          };
+        }
+      }
+
+      console.log(
+        "⚙️ [Prisma Student Count & Query Where Clause]:",
+        JSON.stringify(where),
+      );
+
+      // جلب الطلاب وعداد الإجمالي بالتوازي لرفع الكفاءة الزمنية للاستجابة
+      const [students, total] = await prisma.$transaction([
         prisma.student.findMany({
           where,
           include: {
-            group: { select: { name: true } },
             subscriptions: {
               include: {
-                items: { include: { subject: { select: { name: true } } } },
+                items: {
+                  include: {
+                    session: {
+                      include: {
+                        teacher: true,
+                        room: true,
+                      },
+                    },
+                  },
+                },
               },
             },
           },
@@ -229,161 +1252,267 @@ router.get(
         prisma.student.count({ where }),
       ]);
 
-      // تطبيق منطق فحص انتهاء التاريخ على كل طالب
-      const processedData = students.map((student) =>
-        mapStudentStatus(student),
+      console.log(
+        `✅ [Query Success]: تم استخراج [${students.length}] طالب من أصل إجمالي [${total}] سجل بقاعدة البيانات.`,
       );
-
-      res.json({
+      return res.json({
         success: true,
         pagination: {
-          total,
-          page: Number(page),
-          totalPages: Math.ceil(total / limit),
+          totalStudents: total,
+          currentPage: Number(page),
+          limit: Number(limit),
+          totalPages: Math.ceil(total / Number(limit)),
         },
-        data: processedData,
+        data: students.map(mapStudentStatus), // دالة الماب الآن ترسل حقل qrImageUrl بنجاح للفرونت إند
       });
     } catch (error) {
-      res.status(500).json({ error: "حصل خطأ داخلي" });
+      console.error("❌ Fetch Students Filter Error:", error);
+      return res
+        .status(500)
+        .json({
+          error: "فشل جلب قائمة الطلاب المقيدين بالفلاتر الحالية",
+          details: error.message,
+        });
     }
   },
 );
 
-// =============================================
-// GET /api/students/:id (مع تحديث الحالة اللحظي)
-// =============================================
+// 3) جلب بيانات طالب معين بالتفصيل عبر المعرف الفريد (Profile)
 router.get(
   "/:id",
   authenticateToken,
-  requireActiveSubscription,
+  requireRole(["ADMIN", "SECRETARY"]),
   requireCenterAccess,
   async (req, res) => {
+    const studentId = Number(req.params.id);
+    console.log(
+      `👤 [Route GET /:id]: طلب استدعاء لملف الطالب بالمعرف: ${studentId}`,
+    );
     try {
-      const student = await prisma.student.findFirst({
-        where: { id: Number(req.params.id), centerId: req.user.centerId },
+      const student = await prisma.student.findUnique({
+        where: { id: studentId },
         include: {
-          group: true,
-          subscriptions: { include: { items: { include: { subject: true } } } },
+          subscriptions: {
+            include: {
+              items: {
+                include: {
+                  session: {
+                    include: {
+                      teacher: true,
+                      room: true,
+                    },
+                  },
+                },
+              },
+            },
+          },
         },
       });
 
-      if (!student) return res.status(404).json({ error: "الطالب غير موجود" });
+      if (!student || student.centerId !== req.user.centerId) {
+        console.warn(
+          `⚠️ [Profile Mismatch]: السجل غير متوفر أو لا يتبع نفس السنتر الحركي للمستخدم`,
+        );
+        return res
+          .status(404)
+          .json({
+            error: "الطالب المطلوب غير موجود بسجلات هذا المركز التعليمي",
+          });
+      }
 
-      res.json({ success: true, student: mapStudentStatus(student) });
+      console.log(
+        `✅ [Profile Success]: تم جلب وتصدير كائن الطالب [${student.name}] للملف التعريفي بالكامل.`,
+      );
+      return res.json({
+        success: true,
+        data: mapStudentStatus(student),
+      });
     } catch (error) {
-      res.status(500).json({ error: "خطأ في السيرفر" });
+      console.error(
+        `❌ Fetch Student Profile Error for ID ${studentId}:`,
+        error,
+      );
+      return res
+        .status(500)
+        .json({
+          error: "فشل جلب ملف بيانات الطالب التفصيلي من قاعدة البيانات",
+          details: error.message,
+        });
     }
   },
 );
-// =============================================
-// PUT /api/students/:id - تعديل طالب
-// =============================================
+
+// 4) تحديث بيانات الطالب الحالية (ملف التعريف)
 router.put(
   "/:id",
   authenticateToken,
-  requireActiveSubscription,
   requireRole(["ADMIN", "SECRETARY"]),
-  validateStudentInput,
+  requireCenterAccess,
   async (req, res) => {
-    try {
-      const { id } = req.params;
-      const { name, phone, stage, groupId } = req.body;
-      const { centerId, userId } = req.user;
+    const studentId = Number(req.params.id);
+    const { centerId, userId } = req.user;
+    const { name, phone, stage, grade } = req.body;
 
-      const student = await prisma.student.findFirst({
-        where: { id: Number(id), centerId },
+    console.log(
+      `📝 [Route PUT /:id]: استقبال طلب تعديل وتحرير بيانات الطالب رقم: [${studentId}] من المستخدم: [${userId}]`,
+    );
+    try {
+      const checkExist = await prisma.student.findUnique({
+        where: { id: studentId },
       });
-      if (!student)
+      if (!checkExist || checkExist.centerId !== centerId) {
+        console.warn(
+          `⚠️ [Update Bypass]: محاولة تعديل طالب غير موجود أو ينتمي لمركز آخر من الحساب رقم ${userId}`,
+        );
         return res
           .status(404)
-          .json({ error: "الطالب غير موجود أو لا يتبع سنترك" });
+          .json({
+            error: "الطالب غير موجود بسجلات هذا المركز التعليمي لإتمام التعديل",
+          });
+      }
 
-      const dataToUpdate = {};
-      if (name?.trim()) dataToUpdate.name = name.trim();
-      if (phone?.trim()) dataToUpdate.phone = phone.trim();
-      if (stage) dataToUpdate.stage = stage;
-      if (groupId !== undefined)
-        dataToUpdate.groupId = groupId ? Number(groupId) : null;
+      const updateData = {};
+      if (name?.trim()) updateData.name = name.trim();
+      if (phone?.trim()) updateData.phone = phone.trim();
+      if (stage) updateData.stage = normalizeStage(stage);
+      if (grade !== undefined) updateData.grade = Number(grade);
 
-      if (Object.keys(dataToUpdate).length === 0)
-        return res.status(400).json({ error: "لا توجد بيانات لتعديلها" });
+      console.log(
+        "⚙️ [Student Update Data Payload]:",
+        JSON.stringify(updateData),
+      );
 
       const updatedStudent = await prisma.student.update({
-        where: { id: Number(id) },
-        data: dataToUpdate,
+        where: { id: studentId },
+        data: updateData,
+        include: {
+          subscriptions: {
+            include: {
+              items: {
+                include: {
+                  session: {
+                    include: {
+                      teacher: true,
+                      room: true,
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
       });
 
+      console.log(
+        "📝 [Update Student]: جاري توثيق عملية التحديث في جدول نشاطات المركز...",
+      );
       await prisma.activityLog.create({
         data: {
           centerId,
           userId,
           action: "UPDATE_STUDENT",
           targetType: "Student",
-          targetId: updatedStudent.id,
-          details: JSON.stringify({ updatedFields: Object.keys(dataToUpdate) }),
+          targetId: studentId,
+          details: JSON.stringify({ updatedFields: Object.keys(updateData) }),
         },
       });
 
-      res.json({ message: "تم تعديل الطالب بنجاح", student: updatedStudent });
+      console.log(
+        `✅ [Update Student Success]: تم حفظ التعديلات بنجاح لطالب ID: ${studentId}`,
+      );
+      return res.json({
+        success: true,
+        message: "تم تحديث بيانات ملف الطالب بنجاح معماري تام",
+        data: mapStudentStatus(updatedStudent),
+      });
     } catch (error) {
-      console.error("خطأ في تعديل طالب:", error);
-      res.status(500).json({ error: "حصل خطأ داخلي في السيرفر" });
+      console.error(`❌ Update Student Error for ID ${studentId}:`, error);
+      return res
+        .status(500)
+        .json({
+          error: "فشل تحديث وحفظ بيانات الطالب الجديدة بالخادم",
+          details: error.message,
+        });
     }
   },
 );
 
-// =============================================
-// DELETE /api/students/:id - حذف طالب مع اشتراكاته
-// =============================================
+// 5) حذف الطالب نهائياً وتنظيف كل العلاقات المتشابكة مع السكيما (Cascading Clean Transaction)
 router.delete(
   "/:id",
   authenticateToken,
-  requireActiveSubscription,
   requireRole(["ADMIN"]),
+  requireCenterAccess,
   async (req, res) => {
+    const studentId = Number(req.params.id);
+    const { centerId, userId } = req.user;
+
+    console.log(
+      `🧨 [Route DELETE /:id]: بدء عملية إقصاء وتطهير شامل للطالب ID: [${studentId}] من لوحة التحكم العليا...`,
+    );
     try {
-      const { id } = req.params;
-      const { centerId, userId } = req.user;
-      const studentId = Number(id);
-
-      // التأكد من وجود الطالب وتبعينه للسنتر
-      const student = await prisma.student.findFirst({
-        where: { id: studentId, centerId },
+      const checkExist = await prisma.student.findUnique({
+        where: { id: studentId },
       });
-
-      if (!student) {
+      if (!checkExist || checkExist.centerId !== centerId) {
+        console.warn(
+          `⚠️ [Delete Bypass Attempt]: محاولة تدمير سجل طالب غير موجود أو غير تابع للسنتر من الموظف ${userId}`,
+        );
         return res
           .status(404)
-          .json({ error: "الطالب غير موجود أو لا يتبع سنترك" });
+          .json({ error: "الطالب غير موجود بسجلات السنتر لإتمام عملية الحذف" });
       }
 
-      // تنفيذ الحذف في Transaction لضمان مسح كل المتعلقات معاً
+      console.log(
+        "⛓️ [Prisma Cascade Transaction]: جاري تفكيك ومسح كافة البيانات المرتبطة بالطالب لمنع أخطاء الـ Foreign Keys...",
+      );
       await prisma.$transaction(async (tx) => {
-        // 1. جلب معرفات الاشتراكات التابعة للطالب
+        console.log(
+          "🧹 [Transaction Delete]: جاري تنظيف وإقصاء سجلات الحضور والغياب التاريخية...",
+        );
+        await tx.attendance.deleteMany({ where: { studentId } });
+
+        console.log(
+          "🧹 [Transaction Delete]: جاري مسح تقارير الأداء والدوريات الشهرية المقيدة للطالب...",
+        );
+        await tx.monthlyReportLog.deleteMany({ where: { studentId } });
+
+        console.log(
+          "🧹 [Transaction Delete]: جاري مسح سجلات المسح الميكانيكي الضوئي للـ QR عند الأبواب...",
+        );
+        await tx.attendanceScan.deleteMany({ where: { studentId } });
+
+        console.log(
+          "🧹 [Transaction Delete]: جاري استخراج الاشتراكات التابعة للطالب لهدم بنودها الفرعية...",
+        );
         const subs = await tx.subscription.findMany({
-          where: { studentId: studentId },
+          where: { studentId },
           select: { id: true },
         });
         const subIds = subs.map((s) => s.id);
 
-        // 2. حذف تفاصيل المواد داخل الاشتراكات (Items)
         if (subIds.length > 0) {
+          console.log(
+            `🧹 [Transaction Delete]: جاري حذف عناصر الحصص المتصلة بالاشتراكات لعدد [${subIds.length}] اشتراك مفعّل...`,
+          );
           await tx.subscriptionItem.deleteMany({
             where: { subscriptionId: { in: subIds } },
           });
+
+          console.log(
+            "🧹 [Transaction Delete]: جاري هدم حاويات الاشتراكات المالية كلياً...",
+          );
+          await tx.subscription.deleteMany({ where: { studentId } });
         }
 
-        // 3. حذف الاشتراكات نفسها
-        await tx.subscription.deleteMany({
-          where: { studentId: studentId },
-        });
+        console.log(
+          `🧹 [Transaction Delete]: جاري حرق وحذف السجل الجذري من جدول الطلاب لـ ID: ${studentId}`,
+        );
+        await tx.student.delete({ where: { id: studentId } });
 
-        // 4. حذف الطالب نهائياً
-        await tx.student.delete({
-          where: { id: studentId },
-        });
-
-        // 5. تسجيل العملية في سجل النشاطات
+        console.log(
+          "📝 [Transaction Delete]: جاري توثيق عملية تدمير السجل في اللوج الأمني الأعلى للمنظومة...",
+        );
         await tx.activityLog.create({
           data: {
             centerId,
@@ -392,17 +1521,31 @@ router.delete(
             targetType: "Student",
             targetId: studentId,
             details: JSON.stringify({
-              name: student.name,
-              deletedSubscriptionsCount: subIds.length,
+              name: checkExist.name,
+              phone: checkExist.phone,
             }),
           },
         });
       });
 
-      res.json({ message: "تم حذف الطالب وجميع متعلقاته بنجاح" });
+      console.log(
+        `✅ [Delete Student Success]: تم تطهير وحذف الطالب رقم [${studentId}] ومتعلقاته بنجاح تام وبترتيب العلاقات.`,
+      );
+      return res.json({
+        success: true,
+        message:
+          "تم إقصاء وحذف الطالب بالكامل مع سجلاته التاريخية بنجاح تام 🧨",
+      });
     } catch (error) {
-      console.error("خطأ في حذف طالب:", error);
-      res.status(500).json({ error: "حصل خطأ داخلي في السيرفر" });
+      console.error(
+        `❌ Delete Student Critical Error for ID ${studentId}:`,
+        error,
+      );
+      return res.status(500).json({
+        error:
+          "فشل إتمام عملية حذف الطالب نظراً لوجود قيود معقدة أو متشابكة بقاعدة البيانات",
+        details: error.message,
+      });
     }
   },
 );
