@@ -1,24 +1,29 @@
 const express = require('express');
 const { google } = require('googleapis');
-const path = require('path');
 
 const router = express.Router();
 
-// 1. تحديد مسار ملف الحساب السري (موجود في جذر السيرفر الرئيسي لسهولة الإدارة)
-const keyPath = path.join(process.cwd(), 'service-account.json');
-let key;
-
-try {
-  key = require(keyPath);
-} catch (err) {
-  console.error("❌ [Google Indexing API]: ملف service-account.json غير موجود في جذر السيرفر!");
-}
+// 1. بناء كائن الاعتمادات من متغيرات البيئة (Environment Variables)
+const googleCredentials = {
+  type: process.env.GOOGLE_SERVICE_ACCOUNT_TYPE,
+  project_id: process.env.GOOGLE_PROJECT_ID,
+  private_key_id: process.env.GOOGLE_PRIVATE_KEY_ID,
+  // استبدال الـ \n النصية بكسر سطر حقيقي لضمان سلامة المفتاح عند التشغيل على السيرفر
+  private_key: process.env.GOOGLE_PRIVATE_KEY ? process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n') : undefined,
+  client_email: process.env.GOOGLE_CLIENT_EMAIL,
+  client_id: process.env.GOOGLE_CLIENT_ID,
+  auth_uri: "https://accounts.google.com/o/oauth2/auth",
+  token_uri: "https://oauth2.googleapis.com/token",
+  auth_provider_x509_cert_url: "https://www.googleapis.com/oauth2/v1/certs",
+  client_x509_cert_url: `https://www.googleapis.com/robot/v1/metadata/x509/${encodeURIComponent(process.env.GOOGLE_CLIENT_EMAIL || '')}`,
+  universe_domain: "googleapis.com"
+};
 
 // 2. إعداد عميل الـ JWT وصلاحيات الوصول لجوجل
 const jwtClient = new google.auth.JWT(
-  key?.client_email,
+  googleCredentials.client_email,
   null,
-  key?.private_key,
+  googleCredentials.private_key,
   ['https://www.googleapis.com/auth/indexing'],
   null
 );
@@ -56,11 +61,16 @@ router.post('/request-instant', async (req, res) => {
     });
   }
 
+  // التحقق من وجود المفتاح السري في البيئة
+  if (!googleCredentials.private_key) {
+    return res.status(500).json({ success: false, error: "فشل في تحميل مفاتيح الاعتماد السرية من السيرفر." });
+  }
+
   console.log(`⚡ [Sentryk Indexing Engine]: جاري بدء فهرسة ذكية لعدد (${urlsToProcess.length}) رابط...`);
 
   const results = [];
   
-  // معالجة الروابط حلقة تلو الأخرى لضمان استقرار الطلبات وتفادي الـ Rate Limits
+  // معالجة الروابط لضمان استقرار الطلبات
   for (const targetUrl of urlsToProcess) {
     try {
       const googleResponse = await sendToGoogle(targetUrl, type);
@@ -78,7 +88,6 @@ router.post('/request-instant', async (req, res) => {
     }
   }
 
-  // فرز العمليات الناجحة والفاشلة لتسهيل قراءتها في الفرونت إند
   const totalSuccess = results.filter(r => r.status === 'success').length;
   const totalFailed = results.filter(r => r.status === 'failed').length;
 
