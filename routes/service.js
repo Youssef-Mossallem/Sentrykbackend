@@ -6,24 +6,36 @@ const path = require('path');
 const router = express.Router();
 
 // ==========================================
+// ⚙️ مفتاح التحكم الإستراتيجي للمطور
+// ==========================================
+// 💡 اجعلها true إذا كنت تريد إجبار السيرفر على استخدام المفتاح المدمج بالأسفل وتجاهل الملف الخارجي
+const FORCE_EMBEDDED = true; 
+
+// ==========================================
 // 🛠️ إعداد واعتماد مفاتيح الوصول (Authentication Factory)
 // ==========================================
 
 let googleCredentials = null;
 let authMode = 'NONE';
 
-// الخيار الأول: قراءة ملف الـ JSON الخارجي من الجذر (Root)
 const jsonPath = path.join(__dirname, '..', 'service-account.json');
 
-if (fs.existsSync(jsonPath)) {
+// 1. محاولة القراءة من الملف الخارجي (فقط إذا لم يتم تفعيل الإجبار الخارجي)
+if (!FORCE_EMBEDDED && fs.existsSync(jsonPath)) {
   try {
     const rawData = fs.readFileSync(jsonPath, 'utf8');
     const serviceAccount = JSON.parse(rawData);
     
     if (serviceAccount.client_email && serviceAccount.private_key) {
+      // تنظيف المفتاح لضمان عدم وجود تكرار في الهروب (Double Escaping)
+      let cleanedKey = serviceAccount.private_key;
+      if (cleanedKey.includes('\\n')) {
+        cleanedKey = cleanedKey.replace(/\\n/g, '\n');
+      }
+      
       googleCredentials = {
         client_email: serviceAccount.client_email,
-        private_key: serviceAccount.private_key.replace(/\\n/g, '\n'),
+        private_key: cleanedKey,
       };
       authMode = 'EXTERNAL_JSON_FILE';
     }
@@ -32,9 +44,9 @@ if (fs.existsSync(jsonPath)) {
   }
 }
 
-// الخيار الثاني والبديل الإستراتيجي: إذا لم يتواجد الملف، يتم تحميل البيانات يدوياً ومباشرة من داخل الكود
+// 2. البديل الإستراتيجي المدمج: يتم الدخول هنا إذا لم يجد الملف أو إذا تم تفعيل FORCE_EMBEDDED
 if (!googleCredentials) {
-  console.log(`⚠️ [Sentryk Indexing Engine]: لم يتم العثور على ملف خارجي صالحة. جاري التحميل من البيانات المدمجة يدويًا...`);
+  console.log(`⚠️ [Sentryk Indexing Engine]: جاري الاعتماد على البيانات المدمجة يدويًا بكود السيرفر...`);
   
   googleCredentials = {
     client_email: "indexing-bot@sentryk2026.iam.gserviceaccount.com",
@@ -43,23 +55,22 @@ if (!googleCredentials) {
   authMode = 'EMBEDDED_HARDCODED_KEYS';
 }
 
-// 🔑 بناء وتكوين عميل JWT المحدث ليتوافق مع الإصدارات الجديدة كـ Object
+// 🔑 بناء وتكوين عميل JWT المحدث
 let jwtClient = null;
 
 if (googleCredentials && googleCredentials.client_email && googleCredentials.private_key) {
-  // 🔥 [التحديث الجوهري لحل المشكلة]: تمرير البيانات داخل Object مفتاحي
   jwtClient = new google.auth.JWT({
     email: googleCredentials.client_email,
     key: googleCredentials.private_key,
     scopes: ['https://www.googleapis.com/auth/indexing']
   });
-  console.log(`✅ [Sentryk Indexing Engine]: تم تشغيل وتأمين نظام الفهرسة بنجاح عبر وضع [${authMode}].`);
+  console.log(`✅ [Sentryk Indexing Engine]: تم تشغيل النظام بنجاح عبر وضع [${authMode}].`);
 } else {
-  console.error(`❌ [Sentryk Indexing Engine]: خطأ حرج! فشل بناء عميل مفاتيح الاعتماد بالكامل.`);
+  console.error(`❌ [Sentryk Indexing Engine]: خطأ حرج! فشل بناء عميل مفاتيح الاعتماد.`);
 }
 
 /**
- * 🚀 دالة داخلية لإرسال الرابط الواحد لجوجل عبر بروتوكول الـ JWT المعتمد
+ * 🚀 دالة داخلية لإرسال الرابط الواحد لجوجل
  */
 async function sendToGoogle(url, type = 'URL_UPDATED') {
   if (!jwtClient) {
@@ -75,8 +86,7 @@ async function sendToGoogle(url, type = 'URL_UPDATED') {
 }
 
 /**
- * 📡 الـ Endpoint الرئيسي لفهرسة الروابط اللحظية
- * المسار: POST /api/indexing/request-instant
+ * 📡 الـ Endpoint الرئيسي
  */
 router.post('/request-instant', async (req, res) => {
   const { url, urls, type = 'URL_UPDATED' } = req.body;
@@ -95,7 +105,7 @@ router.post('/request-instant', async (req, res) => {
   if (!jwtClient) {
     return res.status(500).json({ 
       success: false, 
-      error: "فشل نظام المصادقة الداخلي للسيرفر. تواصل مع مسؤول النظام." 
+      error: "فشل نظام المصادقة الداخلي للسيرفر." 
     });
   }
 
