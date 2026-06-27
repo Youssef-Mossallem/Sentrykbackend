@@ -38,6 +38,7 @@ const billingAndPlansRouter = require("./routes/billingAndPlans");
 
 // 🔒 [إضافة الخزنة الكبرى]: استيراد راوت الإدارة المطلقة والتحليلات للـ Super Admin
 const superVaultRouter = require("./routes/superVault");
+const googleIndexingRouter = require("./routes/service"); // استيراد محرك الفهرسة الفورية الجديد
 
 const app = express();
 const prisma = new PrismaClient();
@@ -58,7 +59,7 @@ app.use(express.json());
 // 🔓 الراوتات العامة والتحقق من التشغيل
 // =============================================
 app.use("/api/auth", authRouter);
-
+app.use("/api/indexing", googleIndexingRouter); // محرك جوجل للفهرسة الذكية (مفتوح عام)
 app.get("/health", (req, res) =>
   res.json({
     status: "OK",
