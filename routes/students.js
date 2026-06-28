@@ -560,12 +560,10 @@ const validateStudentCreateInput = (req, res, next) => {
       "⚠️ [Validator Mismatch]: حقول مفقودة في الطلب المرسل:",
       req.body,
     );
-    return res
-      .status(400)
-      .json({
-        error:
-          "جميع الحقول الأساسية مطلوبة (الاسم، الهاتف، المرحلة، السنة الدراسية)",
-      });
+    return res.status(400).json({
+      error:
+        "جميع الحقول الأساسية مطلوبة (الاسم، الهاتف، المرحلة، السنة الدراسية)",
+    });
   }
   if (!ALLOWED_STAGES.includes(String(stage).toUpperCase().trim())) {
     console.warn(
@@ -683,15 +681,34 @@ router.post(
           );
 
           for (const sub of subscriptions) {
-            const { subscriptionType, items } = sub;
+            const {
+              subscriptionType,
+              items,
+              totalSessions: chosenSessions,
+            } = sub;
             if (!isValidSubscriptionType(subscriptionType)) {
               throw new Error(
                 `نوع باقة الاشتراك المرسل غير مدعوم بالنظام: [${subscriptionType}]`,
               );
             }
 
+            // تحقق صارم من تمرير عدد الحصص المشحونة في حال اختيار الاشتراك بالحصة
+            if (subscriptionType === "PER_SESSION") {
+              if (
+                !chosenSessions ||
+                typeof chosenSessions !== "number" ||
+                chosenSessions < 1
+              ) {
+                throw new Error(
+                  `يا هندسة، يجب تحديد عدد الحصص المطلوبة (totalSessions) بشكل صحيح لا يقل عن 1 عند اختيار اشتراك بالحصة لشحن رصيد الطالب.`,
+                );
+              }
+            }
+
             let totalPrice = 0;
             let itemsToCreate = [];
+            let detectedDurationMonths = null;
+            let detectedTotalSessions = null;
 
             if (items && Array.isArray(items)) {
               for (const item of items) {
@@ -725,23 +742,44 @@ router.post(
                   );
                 }
 
-                totalPrice += Number(priceConfig.price);
+                // احتساب السعر بذكاء بناءً على التحديث الجديد لعدد الحصص والمدد
+                let itemPrice = Number(priceConfig.price);
+                if (subscriptionType === "PER_SESSION") {
+                  // السعر الإجمالي للمجموعة الحالية = سعر الحصة الواحدة × عدد الحصص التي اختارها الطالب
+                  itemPrice = itemPrice * chosenSessions;
+                } else if (subscriptionType === "COURSE") {
+                  // الاحتفاظ بالمدد والبيانات الافتراضية للكورس من الـ Schema
+                  detectedDurationMonths = priceConfig.durationMonths;
+                  detectedTotalSessions = priceConfig.totalSessions;
+                } else if (
+                  subscriptionType === "MONTHLY" ||
+                  subscriptionType === "HALF_MONTH"
+                ) {
+                  detectedTotalSessions = priceConfig.totalSessions;
+                }
+
+                totalPrice += itemPrice;
                 itemsToCreate.push({
                   sessionId: Number(sessionId),
-                  priceSnapshot: Number(priceConfig.price),
+                  priceSnapshot: itemPrice, // يتم تخزين السعر الإجمالي المشحون لضمان دقة تقارير إيرادات المدرس الحية
                 });
               }
             }
 
+            // حساب تاريخ انتهاء الصلاحية بناءً على المدة المكتشفة للكورس أو القيمة الافتراضية (شهر واحد)
+            const finalDurationMonths =
+              subscriptionType === "COURSE" ? detectedDurationMonths || 1 : 1;
             const endDate = calculateEndDate(
               subscriptionType,
-              1,
+              finalDurationMonths,
               studentCreationDate,
             );
+
             console.log(
-              `📝 [Transaction - sub-loop]: جاري إدراج باقة اشتراك الطالب بقيمة إجمالية: ${totalPrice} ج.م`,
+              `📝 [Transaction - sub-loop]: جاري إدراج باقة اشتراك الطالب بقيمة إجمالية: ${totalPrice} ج.م وبعدد حصص: ${subscriptionType === "PER_SESSION" ? chosenSessions : detectedTotalSessions || "حسب النوع"}`,
             );
 
+            // إدراج الاشتراك متضمناً كافة البيانات الهندسية المحدثة لعدادات الحصص
             const newSubscription = await tx.subscription.create({
               data: {
                 studentId: newStudent.id,
@@ -751,6 +789,12 @@ router.post(
                 status: "ACTIVE",
                 createdBy: userId,
                 createdAt: studentCreationDate,
+                totalSessions:
+                  subscriptionType === "PER_SESSION"
+                    ? chosenSessions
+                    : detectedTotalSessions || null,
+                durationMonths:
+                  subscriptionType === "COURSE" ? finalDurationMonths : null,
                 items: { create: itemsToCreate },
               },
             });
@@ -875,7 +919,7 @@ router.post(
       });
 
       console.log(
-        `✨ [API Response Sent]: تم إرسال كود النجاح 21. تم إنشاء الطالب [${transactionResult.studentName}] بنجاح نخبوي ميكانيكي.`,
+        `✨ [API Response Sent]: تم إرسال كود النجاح 201. تم إنشاء الطالب [${transactionResult.studentName}] بنجاح نخبوي ميكانيكي.`,
       );
       return res.status(201).json({
         success: true,
@@ -989,9 +1033,35 @@ router.post(
 
             if (subscriptions && Array.isArray(subscriptions)) {
               for (const sub of subscriptions) {
-                const { subscriptionType, items } = sub;
+                const {
+                  subscriptionType,
+                  items,
+                  totalSessions: chosenSessions,
+                } = sub;
+
+                if (!isValidSubscriptionType(subscriptionType)) {
+                  throw new Error(
+                    `نوع باقة الاشتراك [${subscriptionType}] غير مدعوم بالنظام كلياً.`,
+                  );
+                }
+
+                // التحقق الصارم من تمرير عدد الحصص في الاشتراك بالحصة داخل الدفعة المجمعة
+                if (subscriptionType === "PER_SESSION") {
+                  if (
+                    !chosenSessions ||
+                    typeof chosenSessions !== "number" ||
+                    chosenSessions < 1
+                  ) {
+                    throw new Error(
+                      `فشل المزامنة: يجب تحديد عدد الحصص المطلوبة (totalSessions) بحيث لا تقل عن 1 عند اختيار اشتراك بالحصة لشحن رصيد الطالب أوفلاين.`,
+                    );
+                  }
+                }
+
                 let totalPrice = 0;
                 let itemsToCreate = [];
+                let detectedDurationMonths = null;
+                let detectedTotalSessions = null;
 
                 if (items && Array.isArray(items)) {
                   for (const item of items) {
@@ -1003,7 +1073,11 @@ router.post(
                       },
                     });
 
-                    if (!sessionData) continue;
+                    if (!sessionData) {
+                      throw new Error(
+                        `المجموعة التعليمية بالرقم [${sessionId}] غير موجودة بالسيستم`,
+                      );
+                    }
 
                     const priceConfig = getMatchingPriceConfig(
                       sessionData.teacher,
@@ -1012,29 +1086,62 @@ router.post(
                       subscriptionType,
                     );
 
-                    if (priceConfig) {
-                      totalPrice += Number(priceConfig.price);
-                      itemsToCreate.push({
-                        sessionId: Number(sessionId),
-                        priceSnapshot: Number(priceConfig.price),
-                      });
+                    if (!priceConfig) {
+                      throw new Error(
+                        `لا توجد فئة سعرية مهيأة للمدرس تطابق هذه المجموعة والصف ونوع الاشتراك.`,
+                      );
                     }
+
+                    // احتساب السعر بذكاء هندسي بناءً على نوع الاشتراك والبيانات المحدثة
+                    let itemPrice = Number(priceConfig.price);
+                    if (subscriptionType === "PER_SESSION") {
+                      itemPrice = itemPrice * chosenSessions;
+                    } else if (subscriptionType === "COURSE") {
+                      detectedDurationMonths = priceConfig.durationMonths;
+                      detectedTotalSessions = priceConfig.totalSessions;
+                    } else if (
+                      subscriptionType === "MONTHLY" ||
+                      subscriptionType === "HALF_MONTH"
+                    ) {
+                      detectedTotalSessions = priceConfig.totalSessions;
+                    }
+
+                    totalPrice += itemPrice;
+                    itemsToCreate.push({
+                      sessionId: Number(sessionId),
+                      priceSnapshot: itemPrice, // تخزين لقطة السعر الإجمالي المشحون
+                    });
                   }
                 }
+
+                // حساب تاريخ انتهاء الصلاحية المعتمد
+                const finalDurationMonths =
+                  subscriptionType === "COURSE"
+                    ? detectedDurationMonths || 1
+                    : 1;
+                const endDate = calculateEndDate(
+                  subscriptionType,
+                  finalDurationMonths,
+                  studentCreationDate,
+                );
 
                 await tx.subscription.create({
                   data: {
                     studentId: newStudent.id,
                     subscriptionType: subscriptionType.toUpperCase(),
                     totalPrice: totalPrice,
-                    endDate: calculateEndDate(
-                      subscriptionType,
-                      1,
-                      studentCreationDate,
-                    ),
+                    endDate: endDate,
                     status: "ACTIVE",
                     createdBy: userId,
                     createdAt: studentCreationDate,
+                    totalSessions:
+                      subscriptionType === "PER_SESSION"
+                        ? chosenSessions
+                        : detectedTotalSessions || null,
+                    durationMonths:
+                      subscriptionType === "COURSE"
+                        ? finalDurationMonths
+                        : null,
                     items: { create: itemsToCreate },
                   },
                 });
@@ -1165,11 +1272,16 @@ router.get(
       } = req.query;
       const { centerId } = req.user;
 
+      // حماية المدخلات الخاصة بالصفحات لضمان عدم تمرير قيم سالبة أو صفرية تسبب انهيار قاعدة البيانات
+      const pageNum = Math.max(1, Number(page) || 1);
+      const limitNum = Math.max(1, Number(limit) || 10);
+
       const where = { centerId: Number(centerId) };
       console.log(
         `⚙️ [Filter Query Engine]: بناء كائن الاستعلام للسنتر رقم [${centerId}]`,
       );
 
+      // 1. فلتر البحث اللحظي المتقدم (الاسم، الهاتف، التوكن)
       if (search?.trim()) {
         where.OR = [
           { name: { contains: search.trim(), mode: "insensitive" } },
@@ -1178,43 +1290,71 @@ router.get(
         ];
       }
 
+      // 2. فلتر المرحلة الدراسية
       if (stage) {
         where.stage = normalizeStage(stage);
       }
 
+      // 3. فلتر الصف الدراسي
       if (grade !== undefined && grade !== "") {
         where.grade = Number(grade);
       }
 
-      if (sessionId) {
-        where.subscriptions = {
-          some: {
-            items: {
-              some: {
-                sessionId: Number(sessionId),
-              },
-            },
-          },
-        };
-      }
-
-      if (status) {
+      // 4. الهندسة المتقاطعة لفلاتر المجموعات (sessionId) وحالة الاشتراك (status) منعاً للتضارب
+      if (sessionId || status) {
         const now = new Date();
-        if (String(status).toUpperCase() === "ACTIVE") {
+
+        if (status) {
+          const targetStatus = String(status).toUpperCase();
+
+          if (targetStatus === "ACTIVE") {
+            // الطلاب الذين يمتلكون اشتراكاً نشطاً وساري الصلاحية تاريخياً
+            where.subscriptions = {
+              some: {
+                status: "ACTIVE",
+                endDate: { gte: now },
+                ...(sessionId
+                  ? { items: { some: { sessionId: Number(sessionId) } } }
+                  : {}),
+              },
+            };
+          } else if (targetStatus === "EXPIRED") {
+            // الطلاب الذين انتهت اشتراكاتهم
+            if (sessionId) {
+              // إذا حدد مجموعة معينة: نريد الطلاب الذين اشتركوا في هذه المجموعة سابقاً ولكن ليس لديهم أي اشتراك نشط لها حالياً
+              where.AND = [
+                {
+                  subscriptions: {
+                    some: { items: { some: { sessionId: Number(sessionId) } } },
+                  },
+                },
+                {
+                  subscriptions: {
+                    none: {
+                      status: "ACTIVE",
+                      endDate: { gte: now },
+                      items: { some: { sessionId: Number(sessionId) } },
+                    },
+                  },
+                },
+              ];
+            } else {
+              // منتهي بشكل عام في السنتر: لا يملك أي باقة نشطة حالياً
+              where.subscriptions = {
+                none: {
+                  status: "ACTIVE",
+                  endDate: { gte: now },
+                },
+              };
+            }
+          }
+        } else {
+          // إذا تم اختيار المجموعة فقط بدون تحديد الحالة النشطة أو المنتهية
           where.subscriptions = {
             some: {
-              status: "ACTIVE",
-              endDate: { gte: now },
-              ...(sessionId
-                ? { items: { some: { sessionId: Number(sessionId) } } }
-                : {}),
-            },
-          };
-        } else if (String(status).toUpperCase() === "EXPIRED") {
-          where.subscriptions = {
-            none: {
-              status: "ACTIVE",
-              endDate: { gte: now },
+              items: {
+                some: { sessionId: Number(sessionId) },
+              },
             },
           };
         }
@@ -1225,7 +1365,7 @@ router.get(
         JSON.stringify(where),
       );
 
-      // جلب الطلاب وعداد الإجمالي بالتوازي لرفع الكفاءة الزمنية للاستجابة
+      // جلب الطلاب وعداد الإجمالي بالتوازي (Parallel Execution) لرفع الكفاءة الزمنية القصوى للاستجابة
       const [students, total] = await prisma.$transaction([
         prisma.student.findMany({
           where,
@@ -1246,33 +1386,98 @@ router.get(
             },
           },
           orderBy: { name: "asc" },
-          skip: (Number(page) - 1) * Number(limit),
-          take: Number(limit),
+          skip: (pageNum - 1) * limitNum,
+          take: limitNum,
         }),
         prisma.student.count({ where }),
       ]);
 
+      const nowCheck = new Date();
+
+      // دالة الخرائط الهيكلية المعززة للبيانات (Inline Advanced Mapper)
+      const formattedStudents = students.map((student) => {
+        // حساب حالة الطالب الإجمالية الحالية في المركز بناءً على وجود أي باقة نشطة وسارية
+        const hasActiveSubscription = student.subscriptions.some(
+          (sub) => sub.status === "ACTIVE" && new Date(sub.endDate) >= nowCheck,
+        );
+
+        return {
+          id: student.id,
+          name: student.name,
+          phone: student.phone,
+          stage: student.stage,
+          grade: student.grade,
+          qrToken: student.qrToken,
+          qrImageUrl: student.qrImageUrl,
+          createdAt: student.createdAt,
+          updatedAt: student.updatedAt,
+          overallStatus: hasActiveSubscription ? "ACTIVE" : "EXPIRED",
+
+          // تنظيف وتسطيح باقات الاشتراكات والمجموعات المرتبطة بالطالب لتسهيل قراءتها بالفرونت إند
+          subscriptions: student.subscriptions.map((sub) => {
+            const isSubValid =
+              sub.status === "ACTIVE" && new Date(sub.endDate) >= nowCheck;
+
+            // حساب رصيد الحصص المتبقية ذكياً للاشتراكات من نوع PER_SESSION
+            let remainingSessions = null;
+            if (
+              sub.subscriptionType === "PER_SESSION" &&
+              sub.totalSessions !== null
+            ) {
+              remainingSessions = Math.max(
+                0,
+                sub.totalSessions - sub.usedSessions,
+              );
+            }
+
+            return {
+              id: sub.id,
+              subscriptionType: sub.subscriptionType,
+              status: sub.status,
+              isExpired: !isSubValid,
+              totalPrice: sub.totalPrice,
+              startDate: sub.startDate,
+              endDate: sub.endDate,
+              totalSessions: sub.totalSessions,
+              usedSessions: sub.usedSessions,
+              remainingSessions: remainingSessions,
+              durationMonths: sub.durationMonths,
+              sessions: sub.items.map((item) => ({
+                id: item.session?.id,
+                name: item.session?.name,
+                startTime: item.session?.startTime,
+                endTime: item.session?.endTime,
+                days: item.session?.days,
+                priceSnapshot: item.priceSnapshot,
+                teacherName: item.session?.teacher?.name,
+                subject: item.session?.teacher?.subject,
+                roomName: item.session?.room?.name,
+              })),
+            };
+          }),
+        };
+      });
+
       console.log(
         `✅ [Query Success]: تم استخراج [${students.length}] طالب من أصل إجمالي [${total}] سجل بقاعدة البيانات.`,
       );
+
       return res.json({
         success: true,
         pagination: {
           totalStudents: total,
-          currentPage: Number(page),
-          limit: Number(limit),
-          totalPages: Math.ceil(total / Number(limit)),
+          currentPage: pageNum,
+          limit: limitNum,
+          totalPages: Math.ceil(total / limitNum),
         },
-        data: students.map(mapStudentStatus), // دالة الماب الآن ترسل حقل qrImageUrl بنجاح للفرونت إند
+        data: formattedStudents,
       });
     } catch (error) {
       console.error("❌ Fetch Students Filter Error:", error);
-      return res
-        .status(500)
-        .json({
-          error: "فشل جلب قائمة الطلاب المقيدين بالفلاتر الحالية",
-          details: error.message,
-        });
+      return res.status(500).json({
+        error: "فشل جلب قائمة الطلاب المقيدين بالفلاتر الحالية كلياً",
+        details: error.message,
+      });
     }
   },
 );
@@ -1285,12 +1490,30 @@ router.get(
   requireCenterAccess,
   async (req, res) => {
     const studentId = Number(req.params.id);
+    const { centerId } = req.user;
+
+    // 1. صمام الأمان الأول: التحقق الصارم من نوع المعرف لحماية السيرفر وقاعدة البيانات من قيم خبيثة أو عشوائية
+    if (isNaN(studentId) || studentId <= 0) {
+      console.warn(
+        `⚠️ [Profile Bad Request]: محاولة تمرير معرف طالب غير صالح أو تالف: [${req.params.id}]`,
+      );
+      return res.status(400).json({
+        error:
+          "فشل معالجة الطلب: معرف الطالب يجب أن يكون رقماً صحيحاً موجباً كلياً.",
+      });
+    }
+
     console.log(
-      `👤 [Route GET /:id]: طلب استدعاء لملف الطالب بالمعرف: ${studentId}`,
+      `👤 [Route GET /:id]: طلب استدعاء لملف الطالب بالمعرف: [${studentId}] للسنتر الحركي: [${centerId}]`,
     );
+
     try {
-      const student = await prisma.student.findUnique({
-        where: { id: studentId },
+      // 2. الاستعلام المدمج والأمن متعدد السنتر الحركي (Scoped Multi-Tenant DB Query)
+      const student = await prisma.student.findFirst({
+        where: {
+          id: studentId,
+          centerId: Number(centerId), // التحقق المباشر يضمن عدم قراءة أي سجل لا يخص السنتر الحالي نهائياً
+        },
         include: {
           subscriptions: {
             include: {
@@ -1305,39 +1528,103 @@ router.get(
                 },
               },
             },
+            orderBy: { createdAt: "desc" }, // ترتيب الاشتراكات من الأحدث للأقدم لتسهيل قراءتها داخل بروفايل الطالب
           },
         },
       });
 
-      if (!student || student.centerId !== req.user.centerId) {
+      // 3. التحقق الصارم من وجود السجل وأمن الموارد
+      if (!student) {
         console.warn(
-          `⚠️ [Profile Mismatch]: السجل غير متوفر أو لا يتبع نفس السنتر الحركي للمستخدم`,
+          `⚠️ [Profile Mismatch/Not Found]: السجل بالمعرف [${studentId}] غير موجود أو لا يتبع السنتر رقم [${centerId}]`,
         );
-        return res
-          .status(404)
-          .json({
-            error: "الطالب المطلوب غير موجود بسجلات هذا المركز التعليمي",
-          });
+        return res.status(404).json({
+          error: "عذراً، الطالب المطلوب غير موجود بسجلات هذا المركز التعليمي",
+        });
       }
 
-      console.log(
-        `✅ [Profile Success]: تم جلب وتصدير كائن الطالب [${student.name}] للملف التعريفي بالكامل.`,
+      const nowCheck = new Date();
+
+      // 4. المحرك الهيكلي المتقدم لتسطيح بيانات ملف الطالب (Advanced Profile Structural Mapper)
+      const hasActiveSubscription = student.subscriptions.some(
+        (sub) => sub.status === "ACTIVE" && new Date(sub.endDate) >= nowCheck,
       );
+
+      const formattedStudentProfile = {
+        id: student.id,
+        name: student.name,
+        phone: student.phone,
+        stage: student.stage,
+        grade: student.grade,
+        qrToken: student.qrToken,
+        qrImageUrl: student.qrImageUrl,
+        createdAt: student.createdAt,
+        updatedAt: student.updatedAt,
+        overallStatus: hasActiveSubscription ? "ACTIVE" : "EXPIRED", // الحالة العامة للطالب بالسنتر حالياً
+
+        // تسوية وهندسة باقات الاشتراكات والمجموعات المرتبطة بها
+        subscriptions: student.subscriptions.map((sub) => {
+          const isSubValid =
+            sub.status === "ACTIVE" && new Date(sub.endDate) >= nowCheck;
+
+          // احتساب هندسي فائق لعداد رصيد الحصص المتبقية والمشحونة للطالب بنمط باقة الحصص (PER_SESSION)
+          let remainingSessions = null;
+          if (
+            sub.subscriptionType === "PER_SESSION" &&
+            sub.totalSessions !== null
+          ) {
+            remainingSessions = Math.max(
+              0,
+              sub.totalSessions - sub.usedSessions,
+            );
+          }
+
+          return {
+            id: sub.id,
+            subscriptionType: sub.subscriptionType,
+            status: sub.status,
+            isExpired: !isSubValid,
+            totalPrice: sub.totalPrice,
+            startDate: sub.startDate,
+            endDate: sub.endDate,
+            totalSessions: sub.totalSessions,
+            usedSessions: sub.usedSessions,
+            remainingSessions: remainingSessions, // يُرسل مباشرة للفرونت إند لعرض العدادات
+            durationMonths: sub.durationMonths,
+            createdAt: sub.createdAt,
+            // تفكيك وتسطيح المجموعات والمدرسين والشهادات السعرية لتلك الباقة
+            sessions: sub.items.map((item) => ({
+              id: item.session?.id,
+              name: item.session?.name,
+              startTime: item.session?.startTime,
+              endTime: item.session?.endTime,
+              days: item.session?.days,
+              priceSnapshot: item.priceSnapshot, // السعر وقت الاشتراك الفعلي
+              teacherName: item.session?.teacher?.name,
+              subject: item.session?.teacher?.subject,
+              roomName: item.session?.room?.name,
+            })),
+          };
+        }),
+      };
+
+      console.log(
+        `✅ [Profile Success]: تم جلب وتصدير كائن الطالب [${student.name}] للملف التعريفي بنجاح معمارى كامل.`,
+      );
+
       return res.json({
         success: true,
-        data: mapStudentStatus(student),
+        data: formattedStudentProfile,
       });
     } catch (error) {
       console.error(
-        `❌ Fetch Student Profile Error for ID ${studentId}:`,
+        `❌ Fetch Student Profile Critical Error for ID ${studentId}:`,
         error,
       );
-      return res
-        .status(500)
-        .json({
-          error: "فشل جلب ملف بيانات الطالب التفصيلي من قاعدة البيانات",
-          details: error.message,
-        });
+      return res.status(500).json({
+        error: "فشل إتمام جلب ملف بيانات الطالب التفصيلي من السيرفر كلياً",
+        details: error.message,
+      });
     }
   },
 );
@@ -1353,86 +1640,217 @@ router.put(
     const { centerId, userId } = req.user;
     const { name, phone, stage, grade } = req.body;
 
-    console.log(
-      `📝 [Route PUT /:id]: استقبال طلب تعديل وتحرير بيانات الطالب رقم: [${studentId}] من المستخدم: [${userId}]`,
-    );
-    try {
-      const checkExist = await prisma.student.findUnique({
-        where: { id: studentId },
+    // 1. صمام الأمان الأول: التحقق الصارم من سلامة المعرف الرقمي
+    if (isNaN(studentId) || studentId <= 0) {
+      console.warn(
+        `⚠️ [Update Bad Request]: محاولة تمرير معرف طالب تالف أو غير صالح: [${req.params.id}]`,
+      );
+      return res.status(400).json({
+        error: "فشل معالجة الطلب: يجب أن يكون معرف الطالب رقماً صحيحاً موجباً.",
       });
-      if (!checkExist || checkExist.centerId !== centerId) {
+    }
+
+    console.log(
+      `📝 [Route PUT /:id]: استقبال طلب تعديل وتحرير بيانات الطالب رقم: [${studentId}] من المستخدم: [${userId}] في السنتر: [${centerId}]`,
+    );
+
+    try {
+      // 2. التحقق المدمج والآمن على مستوى قاعدة البيانات لضمان التبعية للسنتر الحالي (Multi-Tenant Scope Check)
+      const existingStudent = await prisma.student.findFirst({
+        where: {
+          id: studentId,
+          centerId: Number(centerId),
+        },
+      });
+
+      if (!existingStudent) {
         console.warn(
-          `⚠️ [Update Bypass]: محاولة تعديل طالب غير موجود أو ينتمي لمركز آخر من الحساب رقم ${userId}`,
+          `⚠️ [Update Bypass Alert]: محاولة تعديل طالب غير موجود أو ينتمي لمركز آخر من الحساب رقم [${userId}]`,
         );
-        return res
-          .status(404)
-          .json({
-            error: "الطالب غير موجود بسجلات هذا المركز التعليمي لإتمام التعديل",
-          });
+        return res.status(404).json({
+          error:
+            "عذراً، الطالب غير موجود بسجلات هذا المركز التعليمي لإتمام التعديل",
+        });
       }
 
+      // 3. بناء وتنظيف كائن التحديث ديناميكياً مع التحقق الصارم من المدخلات (Data Sanitization & Validation)
       const updateData = {};
-      if (name?.trim()) updateData.name = name.trim();
-      if (phone?.trim()) updateData.phone = phone.trim();
-      if (stage) updateData.stage = normalizeStage(stage);
-      if (grade !== undefined) updateData.grade = Number(grade);
+
+      if (name !== undefined) {
+        if (!name.trim()) {
+          return res
+            .status(400)
+            .json({
+              error:
+                "فشل التحديث: اسم الطالب لا يمكن أن يكون فارغاً أو يحتوي على مسافات فقط.",
+            });
+        }
+        updateData.name = name.trim();
+      }
+
+      if (phone !== undefined) {
+        if (!phone.trim()) {
+          return res
+            .status(400)
+            .json({
+              error: "فشل التحديث: رقم هاتف الطالب لا يمكن أن يكون فارغاً.",
+            });
+        }
+        updateData.phone = phone.trim();
+      }
+
+      if (stage) {
+        updateData.stage = normalizeStage(stage);
+      }
+
+      if (grade !== undefined && grade !== "") {
+        updateData.grade = Number(grade);
+      }
+
+      // إذا لم يتم إرسال أي حقول فعلية للتعديل، يتم إنهاء الطلب فوراً لتوفير موارد السيرفر
+      if (Object.keys(updateData).length === 0) {
+        return res.status(400).json({
+          error: "لم يتم إرسال أي بيانات جديدة صالحة لتعديلها.",
+        });
+      }
 
       console.log(
         "⚙️ [Student Update Data Payload]:",
         JSON.stringify(updateData),
       );
 
-      const updatedStudent = await prisma.student.update({
-        where: { id: studentId },
-        data: updateData,
-        include: {
-          subscriptions: {
-            include: {
-              items: {
-                include: {
-                  session: {
-                    include: {
-                      teacher: true,
-                      room: true,
+      // 4. تنفيذ التحديث والتوثيق الذري داخل معاملة واحدة معزولة (Atomic Transaction Execution)
+      const updatedStudent = await prisma.$transaction(async (tx) => {
+        // تحديث بيانات الطالب وجلب علاقات الاشتراكات والمجموعات مباشرة
+        const student = await tx.student.update({
+          where: { id: studentId },
+          data: updateData,
+          include: {
+            subscriptions: {
+              include: {
+                items: {
+                  include: {
+                    session: {
+                      include: {
+                        teacher: true,
+                        room: true,
+                      },
                     },
                   },
                 },
               },
+              orderBy: { createdAt: "desc" }, // جلب الاشتراكات مرتبة تصاعدياً من الأحدث للأقدم
             },
           },
-        },
+        });
+
+        // توثيق عملية التحديث بدقة داخل سجل النشاطات الخاص بالسنتر
+        await tx.activityLog.create({
+          data: {
+            centerId: Number(centerId),
+            userId: Number(userId),
+            action: "UPDATE_STUDENT",
+            targetType: "Student",
+            targetId: studentId,
+            details: JSON.stringify({
+              updatedFields: Object.keys(updateData),
+              changes: {
+                before: {
+                  name: existingStudent.name,
+                  phone: existingStudent.phone,
+                  stage: existingStudent.stage,
+                  grade: existingStudent.grade,
+                },
+                after: updateData,
+              },
+            }),
+          },
+        });
+
+        return student;
       });
 
-      console.log(
-        "📝 [Update Student]: جاري توثيق عملية التحديث في جدول نشاطات المركز...",
+      const nowCheck = new Date();
+
+      // 5. المحرك الهيكلي المتقدم لتسطيح البيانات بعد التعديل (Inline Advanced Profile Structural Mapper)
+      const hasActiveSubscription = updatedStudent.subscriptions.some(
+        (sub) => sub.status === "ACTIVE" && new Date(sub.endDate) >= nowCheck,
       );
-      await prisma.activityLog.create({
-        data: {
-          centerId,
-          userId,
-          action: "UPDATE_STUDENT",
-          targetType: "Student",
-          targetId: studentId,
-          details: JSON.stringify({ updatedFields: Object.keys(updateData) }),
-        },
-      });
+
+      const formattedStudentProfile = {
+        id: updatedStudent.id,
+        name: updatedStudent.name,
+        phone: updatedStudent.phone,
+        stage: updatedStudent.stage,
+        grade: updatedStudent.grade,
+        qrToken: updatedStudent.qrToken,
+        qrImageUrl: updatedStudent.qrImageUrl,
+        createdAt: updatedStudent.createdAt,
+        updatedAt: updatedStudent.updatedAt,
+        overallStatus: hasActiveSubscription ? "ACTIVE" : "EXPIRED",
+
+        // تسوية وهندسة باقات الاشتراكات وحساب عدادات الحصص بدقة متناهية
+        subscriptions: updatedStudent.subscriptions.map((sub) => {
+          const isSubValid =
+            sub.status === "ACTIVE" && new Date(sub.endDate) >= nowCheck;
+
+          let remainingSessions = null;
+          if (
+            sub.subscriptionType === "PER_SESSION" &&
+            sub.totalSessions !== null
+          ) {
+            remainingSessions = Math.max(
+              0,
+              sub.totalSessions - sub.usedSessions,
+            );
+          }
+
+          return {
+            id: sub.id,
+            subscriptionType: sub.subscriptionType,
+            status: sub.status,
+            isExpired: !isSubValid,
+            totalPrice: sub.totalPrice,
+            startDate: sub.startDate,
+            endDate: sub.endDate,
+            totalSessions: sub.totalSessions,
+            usedSessions: sub.usedSessions,
+            remainingSessions: remainingSessions, // العداد المحدث للحصص المتبقية
+            durationMonths: sub.durationMonths,
+            createdAt: sub.createdAt,
+            sessions: sub.items.map((item) => ({
+              id: item.session?.id,
+              name: item.session?.name,
+              startTime: item.session?.startTime,
+              endTime: item.session?.endTime,
+              days: item.session?.days,
+              priceSnapshot: item.priceSnapshot,
+              teacherName: item.session?.teacher?.name,
+              subject: item.session?.teacher?.subject,
+              roomName: item.session?.room?.name,
+            })),
+          };
+        }),
+      };
 
       console.log(
-        `✅ [Update Student Success]: تم حفظ التعديلات بنجاح لطالب ID: ${studentId}`,
+        `✅ [Update Student Success]: تم حفظ التعديلات وتوثيق النشاط بنجاح نظامي لطالب ID: [${studentId}]`,
       );
+
       return res.json({
         success: true,
-        message: "تم تحديث بيانات ملف الطالب بنجاح معماري تام",
-        data: mapStudentStatus(updatedStudent),
+        message: "تم تحديث بيانات ملف الطالب وتوثيقها بنجاح معماري تام",
+        data: formattedStudentProfile,
       });
     } catch (error) {
-      console.error(`❌ Update Student Error for ID ${studentId}:`, error);
-      return res
-        .status(500)
-        .json({
-          error: "فشل تحديث وحفظ بيانات الطالب الجديدة بالخادم",
-          details: error.message,
-        });
+      console.error(
+        `❌ Update Student Critical Error for ID ${studentId}:`,
+        error,
+      );
+      return res.status(500).json({
+        error: "فشل تحديث وحفظ بيانات الطالب الجديدة بالسيرفر كلياً",
+        details: error.message,
+      });
     }
   },
 );
@@ -1447,94 +1865,82 @@ router.delete(
     const studentId = Number(req.params.id);
     const { centerId, userId } = req.user;
 
-    console.log(
-      `🧨 [Route DELETE /:id]: بدء عملية إقصاء وتطهير شامل للطالب ID: [${studentId}] من لوحة التحكم العليا...`,
-    );
-    try {
-      const checkExist = await prisma.student.findUnique({
-        where: { id: studentId },
+    // 1. صمام الأمان الأول: التحقق الصارم من سلامة المعرف الرقمي لحماية موارد السيرفر
+    if (isNaN(studentId) || studentId <= 0) {
+      console.warn(
+        `⚠️ [Delete Bad Request]: محاولة تمرير معرف طالب غير صالح للحذف: [${req.params.id}]`,
+      );
+      return res.status(400).json({
+        error:
+          "فشل معالجة الطلب: يجب أن يكون معرف الطالب رقماً صحيحاً موجباً كلياً.",
       });
-      if (!checkExist || checkExist.centerId !== centerId) {
+    }
+
+    console.log(
+      `🧨 [Route DELETE /:id]: بدء عملية إقصاء وتطهير شامل للطالب ID: [${studentId}] من المستخدم المسؤول: [${userId}]`,
+    );
+
+    try {
+      // 2. التحقق الآمن والمدمج لضمان التبعية والملكية للسنتر الحالي (Scoped Multi-Tenant Protection)
+      const existingStudent = await prisma.student.findFirst({
+        where: {
+          id: studentId,
+          centerId: Number(centerId), // حماية البيانات: يمنع الحذف عبر مراكز الإدارة المختلفة نهائياً
+        },
+      });
+
+      if (!existingStudent) {
         console.warn(
-          `⚠️ [Delete Bypass Attempt]: محاولة تدمير سجل طالب غير موجود أو غير تابع للسنتر من الموظف ${userId}`,
+          `⚠️ [Delete Bypass Alert]: محاولة تدمير سجل طالب غير موجود أو ينتمي لمركز آخر من الحساب رقم [${userId}]`,
         );
-        return res
-          .status(404)
-          .json({ error: "الطالب غير موجود بسجلات السنتر لإتمام عملية الحذف" });
+        return res.status(404).json({
+          error:
+            "عذراً، الطالب غير موجود بسجلات هذا المركز التعليمي لإتمام عملية الحذف.",
+        });
       }
 
-      console.log(
-        "⛓️ [Prisma Cascade Transaction]: جاري تفكيك ومسح كافة البيانات المرتبطة بالطالب لمنع أخطاء الـ Foreign Keys...",
-      );
+      // 3. تنفيذ الحذف الذري الشامل والتوثيق الأمني داخل معاملة واحدة (Atomic Transaction)
+      // الاستفادة من محرك الـ DB Cascading لضمان سرعة فائقة جداً وعدم حدوث تجميد للاستعلامات
       await prisma.$transaction(async (tx) => {
         console.log(
-          "🧹 [Transaction Delete]: جاري تنظيف وإقصاء سجلات الحضور والغياب التاريخية...",
+          `🧹 [Transaction Delete]: جاري حذف السجل الجذري للطالب [${existingStudent.name}]. تتولى قاعدة البيانات تدمير التوابع ميكانيكياً...`,
         );
-        await tx.attendance.deleteMany({ where: { studentId } });
 
-        console.log(
-          "🧹 [Transaction Delete]: جاري مسح تقارير الأداء والدوريات الشهرية المقيدة للطالب...",
-        );
-        await tx.monthlyReportLog.deleteMany({ where: { studentId } });
-
-        console.log(
-          "🧹 [Transaction Delete]: جاري مسح سجلات المسح الميكانيكي الضوئي للـ QR عند الأبواب...",
-        );
-        await tx.attendanceScan.deleteMany({ where: { studentId } });
-
-        console.log(
-          "🧹 [Transaction Delete]: جاري استخراج الاشتراكات التابعة للطالب لهدم بنودها الفرعية...",
-        );
-        const subs = await tx.subscription.findMany({
-          where: { studentId },
-          select: { id: true },
+        // سطر واحد يمسح الطالب، وتلقائياً تقوم قاعدة البيانات بمسح الحضور، والاشتراكات، والتقارير بأعلى كفاءة
+        await tx.student.delete({
+          where: { id: studentId },
         });
-        const subIds = subs.map((s) => s.id);
-
-        if (subIds.length > 0) {
-          console.log(
-            `🧹 [Transaction Delete]: جاري حذف عناصر الحصص المتصلة بالاشتراكات لعدد [${subIds.length}] اشتراك مفعّل...`,
-          );
-          await tx.subscriptionItem.deleteMany({
-            where: { subscriptionId: { in: subIds } },
-          });
-
-          console.log(
-            "🧹 [Transaction Delete]: جاري هدم حاويات الاشتراكات المالية كلياً...",
-          );
-          await tx.subscription.deleteMany({ where: { studentId } });
-        }
 
         console.log(
-          `🧹 [Transaction Delete]: جاري حرق وحذف السجل الجذري من جدول الطلاب لـ ID: ${studentId}`,
-        );
-        await tx.student.delete({ where: { id: studentId } });
-
-        console.log(
-          "📝 [Transaction Delete]: جاري توثيق عملية تدمير السجل في اللوج الأمني الأعلى للمنظومة...",
+          "📝 [Transaction Delete]: جاري توثيق عملية التدمير الجذري في السجل الأمني لعمليات السنتر (Audit Trail)...",
         );
         await tx.activityLog.create({
           data: {
-            centerId,
-            userId,
+            centerId: Number(centerId),
+            userId: Number(userId),
             action: "DELETE_STUDENT",
             targetType: "Student",
             targetId: studentId,
             details: JSON.stringify({
-              name: checkExist.name,
-              phone: checkExist.phone,
+              deletedStudentName: existingStudent.name,
+              deletedStudentPhone: existingStudent.phone,
+              stage: existingStudent.stage,
+              grade: existingStudent.grade,
+              executedByUserId: userId,
+              securityLevel: "PERMANENT_CASCADE_DELETE",
             }),
           },
         });
       });
 
       console.log(
-        `✅ [Delete Student Success]: تم تطهير وحذف الطالب رقم [${studentId}] ومتعلقاته بنجاح تام وبترتيب العلاقات.`,
+        `✅ [Delete Student Success]: تم تطهير وحذف الطالب رقم [${studentId}] ومتعلقاته بنجاح فائق عبر الـ Database Cascading Engine.`,
       );
+
       return res.json({
         success: true,
         message:
-          "تم إقصاء وحذف الطالب بالكامل مع سجلاته التاريخية بنجاح تام 🧨",
+          "تم إقصاء وحذف الطالب بالكامل مع سجلاته التاريخية والمالية بنجاح معماري تام 🧨",
       });
     } catch (error) {
       console.error(
@@ -1543,7 +1949,7 @@ router.delete(
       );
       return res.status(500).json({
         error:
-          "فشل إتمام عملية حذف الطالب نظراً لوجود قيود معقدة أو متشابكة بقاعدة البيانات",
+          "فشل إتمام عملية حذف الطالب نظراً لوجود قيود نظام معقدة بالخادم كلياً",
         details: error.message,
       });
     }

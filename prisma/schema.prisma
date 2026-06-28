@@ -62,21 +62,21 @@ enum BillingCycle {
 // =============================================
 
 model User {
-  id               Int            @id @default(autoincrement())
-  name             String
-  email            String         @unique
-  password         String
-  role             Role
-  centerId         Int
-  isActive         Boolean        @default(true)
-  resetToken       String?
-  resetTokenExpiry DateTime?
-  createdAt        DateTime       @default(now())
-  updatedAt        DateTime       @updatedAt
-  center           Center         @relation(fields: [centerId], references: [id], onDelete: Cascade)
-  activityLogs     ActivityLog[]
+  id                   Int           @id @default(autoincrement())
+  name                 String
+  email                String        @unique
+  password             String
+  role                 Role
+  centerId             Int
+  isActive             Boolean       @default(true)
+  resetToken           String?
+  resetTokenExpiry     DateTime?
+  createdAt            DateTime      @default(now())
+  updatedAt            DateTime      @updatedAt
+  center               Center        @relation(fields: [centerId], references: [id], onDelete: Cascade)
+  activityLogs         ActivityLog[]
   createdSubscriptions Subscription[] @relation("CreatedSubscriptions")
-  payments         Payment[]
+  payments             Payment[]
 }
 
 model Center {
@@ -109,7 +109,7 @@ model Center {
   activePromoCode   PromoCode? @relation("CenterActivePromo", fields: [activePromoCodeId], references: [id], onDelete: SetNull)
   promoMonthsUsed   Int        @default(0) 
   promoAppliedAt    DateTime? 
-  isPromoPaused     Boolean    @default(false) // ✨ ميزة التحكم الذكي الجديدة: إيقاف الخصم مؤقتاً لسنتر معين
+  isPromoPaused     Boolean    @default(false) // ميزة التحكم الذكي الجديدة
 
   // العلاقات العامة للسنتر
   users             User[]
@@ -124,8 +124,8 @@ model Center {
   monthlyReportLogs MonthlyReportLog[]
   attendanceScans   AttendanceScan[]
   shortLinks        ShortLink[]
-  pendingFreeMonths  Int       @default(0)
-  planExpiresAt DateTime?
+  pendingFreeMonths Int                @default(0)
+  planExpiresAt     DateTime?
 }
 
 model Student {
@@ -175,7 +175,7 @@ model Session {
   name              String
   teacherId         Int
   roomId            Int
-  days              String[]
+  days              String[]                  // مثل ["Saturday", "Wednesday"]
   startTime         String
   endTime           String
   maxStudents       Int
@@ -196,7 +196,12 @@ model PriceConfiguration {
   stage            Stage
   grades           Int[]
   subscriptionType SubscriptionType
-  price            Float
+  price            Float            // سعر الحصة الواحدة، أو الشهر، أو الكورس بالكامل
+  
+  // ✨ حقول جديدة مضافة لإصلاح النقص في منطق المدد
+  durationMonths   Int?             // مدة الكورس بالشهور (تستخدم لو نوع الاشتراك COURSE)
+  totalSessions    Int?             // عدد الحصص الافتراضي لهذه الحزمة إن وجد
+
   createdAt        DateTime         @default(now())
   updatedAt        DateTime         @updatedAt
   teacher          Teacher          @relation(fields: [teacherId], references: [id], onDelete: Cascade)
@@ -248,21 +253,18 @@ model Payment {
   paidAt                DateTime?
   metadata              Json?
 
-  // ✨ حقول الدورة المحاسبية والأمان الرقمي الجديدة (تمنع التخمين نهائياً)
-  billingCycle          BillingCycle?       // لمعرفة هل الفاتورة شهرياً أم سنوياً بشكل صريح
-  durationMonths        Int                 @default(1) // عدد الشهور المدفوعة للتحقق الإضافي
-  planPrice             Float?              // لتخزين السعر الأصلي للباقة قبل أي خصومات
-  activatedAt           DateTime?           // وقت تفعيل الخدمة الفعلي في نظامك
-  processedAt           DateTime?           // وقت معالجة الـ Webhook النهائي
+  billingCycle          BillingCycle?       
+  durationMonths        Int                 @default(1) 
+  planPrice             Float?              
+  activatedAt           DateTime?           
+  processedAt           DateTime?           
 
-  // العلاقات
   center                Center              @relation(fields: [centerId], references: [id], onDelete: Cascade)
   createdByUser         User?               @relation(fields: [createdBy], references: [id])
   centerSubscription    CenterSubscription? @relation("SubToPayments", fields: [centerSubscriptionId], references: [id])
   promoCode             PromoCode?          @relation(fields: [promoCodeId], references: [id], onDelete: SetNull)
   whatsappTransactions  WhatsAppTransaction[]
 
-  // 🛡️ فهارس أمان وسرعة لمنع حالات التزامن (Race Conditions) أثناء الـ Webhook
   @@index([merchantReference])
   @@index([status])
 }
@@ -271,13 +273,19 @@ model Subscription {
   id               Int                @id @default(autoincrement())
   studentId        Int
   startDate        DateTime           @default(now())
-  endDate          DateTime
+  endDate          DateTime           // تاريخ الانتهاء المحسوب بدقة هندسية
   status           SubscriptionStatus @default(ACTIVE)
   totalPrice       Float
   subscriptionType SubscriptionType
   createdBy        Int?
   createdAt        DateTime           @default(now())
   updatedAt        DateTime           @updatedAt
+
+  // ✨ حقول التحكم الذكي والمطاطي في الحصص والكورسات المضافة حديثاً
+  totalSessions    Int?               // إجمالي عدد الحصص المدفوعة (إجباري لو النوع PER_SESSION)
+  usedSessions     Int                @default(0) // عداد الحصص المستهلكة فعلياً من الطالب
+  durationMonths   Int?               // مدة الاشتراك بالشهور (لو النوع COURSE)
+
   student          Student            @relation(fields: [studentId], references: [id], onDelete: Cascade)
   createdByUser    User?              @relation("CreatedSubscriptions", fields: [createdBy], references: [id])
   items            SubscriptionItem[]
@@ -295,11 +303,11 @@ model SubscriptionItem {
 }
 
 model WhatsAppWallet {
-  id           Int                 @id @default(autoincrement())
-  centerId     Int                 @unique
-  balance      Int                 @default(0)
-  updatedAt    DateTime            @updatedAt
-  center       Center              @relation(fields: [centerId], references: [id], onDelete: Cascade)
+  id        Int                 @id @default(autoincrement())
+  centerId  Int                 @unique
+  balance   Int                 @default(0)
+  updatedAt DateTime            @updatedAt
+  center    Center              @relation(fields: [centerId], references: [id], onDelete: Cascade)
   transactions WhatsAppTransaction[]
 }
 

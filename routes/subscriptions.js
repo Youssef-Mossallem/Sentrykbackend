@@ -14,43 +14,137 @@ const router = express.Router();
 const prisma = new PrismaClient();
 
 // =============================================
-// مساعدات الوقت والتاريخ وقفل اللوجيك (Helpers)
+// مساعدات الوقت والتاريخ وقفل اللوجيك الهندسية (Helpers)
 // =============================================
 
 /**
- * دالة مساعدة مطورة لحساب تاريخ النهاية التراكمي متوافقة مع الأوفلاين
- * تم إضافة المعامل referenceDate لضمان البناء فوق التوقيت التاريخي الصحيح للأوفلاين بدلاً من وقت السيرفر الحالي
+ * دالة مساعدة مطورة ومطاطية لحساب تاريخ النهاية التراكمي متوافقة تماماً مع الأوفلاين والأونلاين.
+ * تم تعديل اللوجيك الخاص بنوع PER_SESSION ليقوم بحساب تاريخ انتهاء الاشتراك بناءً على جدول أيام الحصص الفعلي
+ * للمجموعة وعدد الحصص المشتراة ليكون النظام ذكياً ومحاكياً للواقع تماماً بمستوى الشركات.
+ * * @param {string} subscriptionType - نوع الباقة (MONTHLY, HALF_MONTH, COURSE, PER_SESSION)
+ * @param {Date|string} currentEndDate - تاريخ انتهاء الاشتراك الحالي (في حال التجديد التراكمي)
+ * @param {number} durationInMonths - المدة بالشهور لباقة الكورسات
+ * @param {Date} referenceDate - تاريخ بدء العملية (الحالي أو وقت الأوفلاين المالي)
+ * @param {Array} perSessionData - مصفوفة كائنات تحتوي على أيام المجموعات وعدد الحصص المشتراة لكل مجموعة
  */
 const calculateEndDate = (
   subscriptionType,
   currentEndDate,
   durationInMonths = 1,
-  referenceDate = new Date()
+  referenceDate = new Date(),
+  perSessionData = null,
 ) => {
-  // 🚀 لو الاشتراك الحالي لسه مانتهاش بالنسبة لوقت العملية المحددة، بنبني التاريخ الجديد فوق القديم لضمان حق الطالب كاملاً
+  // 🚀 إذا كان الاشتراك الحالي سارياً بالنسبة لوقت العملية المحددة، نبني التاريخ الجديد فوق القديم لضمان حق الطالب كاملاً
   const baseDate =
     currentEndDate && new Date(currentEndDate) > referenceDate
       ? new Date(currentEndDate)
       : new Date(referenceDate);
 
   const end = new Date(baseDate);
-  end.setHours(23, 59, 59, 999);
+  const monthsToAdd = Number(durationInMonths) || 1;
 
   switch (subscriptionType) {
     case "HALF_MONTH":
       end.setDate(end.getDate() + 15);
       break;
     case "COURSE":
-      end.setMonth(end.getMonth() + (durationInMonths || 3));
+      end.setMonth(end.getMonth() + monthsToAdd);
       break;
     case "PER_SESSION":
-      end.setDate(end.getDate() + 1); // الحصة تنتهي بنهاية اليوم
+      // اللوجيك الذكي والمحدث: حساب انتهاء الاشتراك الفعلي بناءً على مواعيد المجموعات
+      if (
+        perSessionData &&
+        Array.isArray(perSessionData) &&
+        perSessionData.length > 0
+      ) {
+        let maxCalculatedEndDate = new Date(baseDate);
+        const daysMap = {
+          sunday: 0,
+          monday: 1,
+          tuesday: 2,
+          wednesday: 3,
+          thursday: 4,
+          friday: 5,
+          saturday: 6,
+        };
+
+        // المرور على المجموعات المشترك بها لحساب أبعد تاريخ انتهاء لحماية حق الوصول للطالب
+        for (const group of perSessionData) {
+          if (!group.days || group.days.length === 0 || !group.totalSessions)
+            continue;
+
+          // تنظيف مصفوفة الأيام وتحويلها إلى أرقام مقابلة لأيام الأسبوع في JS
+          const groupDays = group.days.map((d) => d.trim().toLowerCase());
+          let remainingSessions = Number(group.totalSessions);
+          let current = new Date(baseDate);
+
+          if (remainingSessions <= 0) continue;
+
+          // العثور على أول حصة تقع في المستقبل بناءً على ترتيب مصفوفة الأيام (مثال العميل: اشتراك الثلاثاء يبدأ السبت)
+          let firstDayName = groupDays[0];
+          let firstDayIdx = daysMap[firstDayName];
+
+          if (firstDayIdx !== undefined) {
+            let foundFirstSession = false;
+
+            // البحث عبر الأسبوعين القادمين عن أول يوم يطابق اليوم الأول للمجموعة تماشياً مع ترتيب الدورة التعليمية
+            for (let i = 0; i < 14; i++) {
+              if (i > 0 || current.getDay() !== firstDayIdx) {
+                current.setDate(current.getDate() + 1);
+              }
+              if (current.getDay() === firstDayIdx) {
+                foundFirstSession = true;
+                break;
+              }
+            }
+
+            if (foundFirstSession) {
+              remainingSessions--; // خصم الحصة الأولى التي تم تحديد تاريخها بنجاح
+              let dayArrayPointer = 1; // الانتقال لليوم التالي المجدول في مصفوفة المجموعة
+
+              // تتبع باقي الحصص المشتراة دورياً وبشكل تتابعي صارم
+              let safetyCounter = 0;
+              while (remainingSessions > 0 && safetyCounter < 500) {
+                const nextDayName =
+                  groupDays[dayArrayPointer % groupDays.length];
+                const nextDayIdx = daysMap[nextDayName];
+
+                if (nextDayIdx !== undefined) {
+                  // التقدم باليوم في التقويم حتى الوصول لليوم التالي المحدد في جدول الحصص
+                  for (let j = 0; j < 7; j++) {
+                    current.setDate(current.getDate() + 1);
+                    if (current.getDay() === nextDayIdx) {
+                      remainingSessions--;
+                      break;
+                    }
+                  }
+                }
+                dayArrayPointer++;
+                safetyCounter++;
+              }
+
+              // إذا كان تاريخ انتهاء هذه المجموعة أبعد من التواريخ السابقة، نعتمد الأبعد لضمان الاستقرار
+              if (current > maxCalculatedEndDate) {
+                maxCalculatedEndDate = new Date(current);
+              }
+            }
+          }
+        }
+        end.setTime(maxCalculatedEndDate.getTime());
+      } else {
+        // حماية تراجعية (Fallback) في حال عدم إرسال أيام مواعيد المجموعات لأي سبب هندسي مفاجئ
+        end.setDate(end.getDate() + 30);
+      }
       break;
+
     case "MONTHLY":
     default:
-      end.setMonth(end.getMonth() + 1);
+      end.setMonth(end.getMonth() + monthsToAdd);
       break;
   }
+
+  // ضبط نهاية اليوم بشكل دقيق جداً هندسياً ومقاوم للمناطق الزمنية
+  end.setHours(23, 59, 59, 999);
   return end;
 };
 
@@ -61,10 +155,13 @@ async function safeSendWhatsApp(studentId, type, payload = {}) {
   try {
     if (typeof sendAutoWhatsApp === "function") {
       await sendAutoWhatsApp(studentId, type, payload);
+      console.log(
+        `✅ [WHATSAPP SUCCESS] تم إرسال رسالة التجديد/الاشتراك بنجاح للطالب: ${studentId}`,
+      );
     }
   } catch (error) {
     console.error(
-      `❌ [SUBSCRIPTION ROUTE WHATSAPP ERROR] لـ الطالب رقم ${studentId}:`,
+      `❌ [SUBSCRIPTION ROUTE WHATSAPP ERROR] فشل إرسال رسالة الواتساب لـ الطالب رقم ${studentId}:`,
       error.message,
     );
   }
@@ -88,12 +185,15 @@ router.post(
     }
 
     try {
-      // استقبال حقول الأوفلاين الاختيارية من الفرونت إند
-      const { items, isOfflineMode, offlineCreatedAt } = req.body; 
+      // استقبال حقول الأوفلاين الاختيارية وحزمة المجموعات من الواجهة الأمامية
+      const { items, isOfflineMode, offlineCreatedAt } = req.body;
       const { centerId, userId } = req.user;
 
-      // تحديد وقت البدء الحقيقي للعملية ماليًا وزمنيًا
-      const subscriptionActionDate = isOfflineMode && offlineCreatedAt ? new Date(offlineCreatedAt) : new Date();
+      // تحديد وقت البدء الحقيقي للعملية ماليًا وزمنيًا بناءً على وقت حدوثها الفعلي في الأوفلاين أو التوقيت الحالي
+      const subscriptionActionDate =
+        isOfflineMode && offlineCreatedAt
+          ? new Date(offlineCreatedAt)
+          : new Date();
 
       // 1. جلب بيانات الطالب مع آخر اشتراك نشط له متضمناً المجموعات والمدرسين لربطها بالهيكلة الجديدة
       const student = await prisma.student.findFirst({
@@ -116,7 +216,21 @@ router.post(
       if (!student) {
         return res
           .status(404)
-          .json({ error: "الطالب غير موجود بالنظام أو لا يتبع هذا السنتر" });
+          .json({ error: "الطالب غير موجود بالنظام أو لا يتبع هذا السنتر 🛑" });
+      }
+
+      // التحقق وتأمين صيغة المرحلة الدراسية للطالب ومطابقتها مع الـ Enum الخاص بالبريسما
+      const validStages = ["PRIMARY", "MIDDLE", "HIGH"];
+      const studentStageEnum = validStages.includes(
+        student.stage?.toUpperCase(),
+      )
+        ? student.stage.toUpperCase()
+        : null;
+
+      if (!studentStageEnum) {
+        return res.status(400).json({
+          error: "المرحلة الدراسية المسجلة للطالب غير صالحة للنظام السحابي 🛑",
+        });
       }
 
       isFirstSubscription = student.subscriptions.length === 0;
@@ -125,6 +239,9 @@ router.post(
       // 2. معالجة وتأمين البيانات بواسطة DB Transaction لمنع أي خطأ مالي أو تضارب بالبيانات
       const dbResult = await prisma.$transaction(async (tx) => {
         let subscription;
+        let finalTotalSessions = null;
+        let finalDurationMonths = null;
+        const perSessionData = [];
 
         // 💡 [الحالة أ]: تجديد تلقائي للمجموعات الحالية (عند إرسال المصفوفة فارغة أو غير موجودة بالـ body)
         if (!items || items.length === 0) {
@@ -145,7 +262,7 @@ router.post(
             const priceRecord = await tx.priceConfiguration.findFirst({
               where: {
                 teacherId: oldItem.session.teacherId,
-                stage: student.stage,
+                stage: studentStageEnum,
                 subscriptionType: globalSubType,
                 grades: { has: student.grade }, // التحقق الذكي من مصفوفة السنوات بالبريسما
               },
@@ -153,7 +270,7 @@ router.post(
 
             if (!priceRecord) {
               throw new Error(
-                `لم يتم العثور على إعدادات تسعير صالحة للمدرس ${oldItem.session.teacher?.name || ""} متوافقة مع مرحلة وسنة الطالب.`,
+                `لم يتم العثور على إعدادات تسعير صالحة للمدرس ${oldItem.session.teacher?.name || ""} متوافقة مع مرحلة وسنة الطالب الحالية.`,
               );
             }
 
@@ -162,10 +279,32 @@ router.post(
               sessionId: oldItem.sessionId,
               priceSnapshot: priceRecord.price,
             });
+
+            // تجميع القيم المضافة حديثاً لإصلاح منطق المدد والحصص التراكمي الشامل
+            if (globalSubType === "PER_SESSION" && priceRecord.totalSessions) {
+              finalTotalSessions =
+                (finalTotalSessions || 0) + priceRecord.totalSessions;
+              perSessionData.push({
+                days: oldItem.session.days,
+                totalSessions: priceRecord.totalSessions,
+              });
+            }
+            if (globalSubType === "COURSE" && priceRecord.durationMonths) {
+              finalDurationMonths = Math.max(
+                finalDurationMonths || 0,
+                priceRecord.durationMonths,
+              );
+            }
           }
 
-          // استخدام مرجع تاريخ العملية الأوفلاين الصحيح بدلاً من وقت الخادم التلقائي
-          const newEndDate = calculateEndDate(globalSubType, activeSub.endDate, 1, subscriptionActionDate);
+          // حساب تاريخ الانتهاء بناءً على المدة المستخرجة من باقة الكورس أو جدول تتابع حصص الـ PER_SESSION الفعلي
+          const newEndDate = calculateEndDate(
+            globalSubType,
+            activeSub.endDate,
+            finalDurationMonths || 1,
+            subscriptionActionDate,
+            perSessionData,
+          );
 
           // تنظيف البنود القديمة لإعادة حقنها بالأسعار والبيانات المحدثة منعاً للتكرار
           await tx.subscriptionItem.deleteMany({
@@ -179,6 +318,10 @@ router.post(
               endDate: newEndDate,
               totalPrice: totalPrice,
               status: "ACTIVE",
+              totalSessions: finalTotalSessions
+                ? (activeSub.totalSessions || 0) + finalTotalSessions
+                : activeSub.totalSessions,
+              durationMonths: finalDurationMonths || activeSub.durationMonths,
               updatedAt: new Date(),
             },
           });
@@ -206,7 +349,7 @@ router.post(
             const itemFromReq = items.find((i) => Number(i.sessionId) === sId);
             const subType = itemFromReq.subscriptionType || globalSubType;
 
-            // جلب بيانات المجموعة للوصول لمعرف المدرس التابع لها
+            // جلب بيانات المجموعة للوصول لمعرف المدرس والجدول الزمني التابع لها
             const session = await tx.session.findUnique({
               where: { id: sId },
               include: { teacher: true },
@@ -222,7 +365,7 @@ router.post(
             const priceRecord = await tx.priceConfiguration.findFirst({
               where: {
                 teacherId: session.teacherId,
-                stage: student.stage,
+                stage: studentStageEnum,
                 subscriptionType: subType,
                 grades: { has: student.grade },
               },
@@ -239,13 +382,30 @@ router.post(
               sessionId: sId,
               priceSnapshot: priceRecord.price,
             });
+
+            // حساب الحصص والشهور وبناء مصفوفة التتبع الحصصي الذكي
+            if (subType === "PER_SESSION" && priceRecord.totalSessions) {
+              finalTotalSessions =
+                (finalTotalSessions || 0) + priceRecord.totalSessions;
+              perSessionData.push({
+                days: session.days,
+                totalSessions: priceRecord.totalSessions,
+              });
+            }
+            if (subType === "COURSE" && priceRecord.durationMonths) {
+              finalDurationMonths = Math.max(
+                finalDurationMonths || 0,
+                priceRecord.durationMonths,
+              );
+            }
           }
 
           const newEndDate = calculateEndDate(
             globalSubType,
             activeSub?.endDate,
-            1,
-            subscriptionActionDate
+            finalDurationMonths || 1,
+            subscriptionActionDate,
+            perSessionData,
           );
 
           if (activeSub) {
@@ -262,6 +422,9 @@ router.post(
                 startDate: subscriptionActionDate,
                 endDate: newEndDate,
                 status: "ACTIVE",
+                totalSessions: finalTotalSessions,
+                usedSessions: 0, // إعادة تعيين العداد لإطلاق الدورة الحالية الجديدة لضمان الاستقرار
+                durationMonths: finalDurationMonths,
                 updatedAt: new Date(),
               },
             });
@@ -275,6 +438,9 @@ router.post(
                 subscriptionType: globalSubType,
                 totalPrice: totalPrice,
                 status: "ACTIVE",
+                totalSessions: finalTotalSessions,
+                usedSessions: 0,
+                durationMonths: finalDurationMonths,
                 createdBy: userId,
                 createdAt: subscriptionActionDate,
               },
@@ -291,7 +457,7 @@ router.post(
           });
         }
 
-        // جلب كائن الاشتراك النهائي مدمجاً بكافة تفاصيل العلاقات الجديدة لعرضها الفوري بالفرونت إند
+        // جلب كائن الاشتراك النهائي مدمجاً بكافة تفاصيل العلاقات الجديدة لعرضها الفوري بالفرونت إند وإرسالها للواتساب
         subscription = await tx.subscription.findUnique({
           where: { id: subscription.id },
           include: {
@@ -308,9 +474,11 @@ router.post(
           data: {
             centerId,
             userId,
-            action: isOfflineMode 
-              ? "SYNC_OFFLINE_SUBSCRIPTION" 
-              : (isFirstSubscription ? "CREATE_SUBSCRIPTION" : "RENEW_SUBSCRIPTION"),
+            action: isOfflineMode
+              ? "SYNC_OFFLINE_SUBSCRIPTION"
+              : isFirstSubscription
+                ? "CREATE_SUBSCRIPTION"
+                : "RENEW_SUBSCRIPTION",
             targetType: "Subscription",
             targetId: subscription.id,
             createdAt: subscriptionActionDate,
@@ -318,7 +486,9 @@ router.post(
               totalPrice: subscription.totalPrice,
               endDate: subscription.endDate,
               sessionsCount: subscription.items.length,
-              isOfflineSync: !!isOfflineMode
+              durationMonths: subscription.durationMonths,
+              totalSessions: subscription.totalSessions,
+              isOfflineSync: !!isOfflineMode,
             }),
           },
         });
@@ -326,21 +496,26 @@ router.post(
         return subscription;
       });
 
-      // 🚀 [تحديث السحر الـ WhatsAppي الجديد]
-      // توجيه الإرسال دائماً لقالب الـ FIRST_SUB المتطور والمسؤول عن صياغة وعرض باقة الحصص الحالية والجديدة لولي الأمر
-      safeSendWhatsApp(studentIdNum, "FIRST_SUB").catch((err) => {
-        console.error(
-          `[BACKGROUND WHATSAPP EXCEPTION IN ROUTE] طالب ${studentIdNum}:`,
-          err.message,
-        );
+      // 🚀 [تحديث السحر الـ WhatsAppي الجديد للأوفلاين والاونلاين بكافة تفاصيل المدد الحصصية والزمنية]
+      safeSendWhatsApp(studentIdNum, "FIRST_SUB", {
+        subscriptionId: dbResult.id,
+        studentName: student.name,
+        subscriptionType: dbResult.subscriptionType,
+        totalPrice: dbResult.totalPrice,
+        endDate: dbResult.endDate,
+        durationMonths: dbResult.durationMonths, // إرسال مدة الكورس لرسالة الواتساب الفورية 🔥
+        totalSessions: dbResult.totalSessions,
+        isOfflineProcessed: !!isOfflineMode,
+        groups: dbResult.items.map((i) => i.session?.name || "غير مححدد"),
       });
 
-      // استجابة مطابقة تماماً للمتطلبات والمعايير القياسية للوحة التحكم
       return res.json({
         success: true,
         message: isOfflineMode
-          ? "تمت مزامنة وحفظ الاشتراك الأوفلاين بنجاح مالي تام ⚡✅"
-          : (isFirstSubscription ? "تم تسجيل الاشتراك وتسكين Mجموعات بنجاح 🎉" : "تم تجديد الاشتراك بنجاح مالي واستقرار تام بالخادم ✅"),
+          ? "تمت مزامنة وحفظ الاشتراك الأوفلاين بنجاح مالي تام وتنبيه ولي الأمر ⚡✅"
+          : isFirstSubscription
+            ? "تم تسجيل الاشتراك وتسكين المجموعات بنجاح 🎉"
+            : "تم تجديد الاشتراك بنجاح مالي واستقرار تام بالخادم ✅",
         subscription: {
           id: dbResult.id,
           type: dbResult.subscriptionType,
@@ -348,6 +523,8 @@ router.post(
           endDate: dbResult.endDate,
           totalPrice: dbResult.totalPrice,
           status: dbResult.status,
+          totalSessions: dbResult.totalSessions,
+          durationMonths: dbResult.durationMonths,
           enrolledSessions: dbResult.items.map((item) => ({
             sessionId: item.sessionId,
             sessionName: item.session?.name || "غير محدد",
@@ -365,7 +542,7 @@ router.post(
 );
 
 // =============================================
-// 1B️⃣ POST /api/subscriptions/bulk-sync - مزامنة جماعية للاشتراكات المسجلة أوفلاين (Bulk Subscription Sync)
+// 1B️⃣ POST /api/subscriptions/bulk-sync - مزامنة جماعية ممتازة للاشتراكات المسجلة أوفلاين لدعم حقول الكورسات والمدد بدقة
 // =============================================
 router.post(
   "/bulk-sync",
@@ -375,28 +552,40 @@ router.post(
   requireCenterAccess,
   async (req, res) => {
     try {
-      const { subscriptionsArray } = req.body; // يتوقع مصفوفة من العمليات: [{ studentId: 10, items: [], offlineCreatedAt: "..." }]
+      const { subscriptionsArray } = req.body;
       const { centerId, userId } = req.user;
 
-      if (!Array.isArray(subscriptionsArray) || subscriptionsArray.length === 0) {
-        return res.status(400).json({ error: "يجب إرسال مصفوفة اشتراكات صالحة لبدء المزامنة" });
+      if (
+        !Array.isArray(subscriptionsArray) ||
+        subscriptionsArray.length === 0
+      ) {
+        return res.status(400).json({
+          error: "يجب إرسال مصفوفة اشتراكات صالحة لبدء المزامنة الجماعية 🛑",
+        });
       }
 
-      const syncResultSummary = { succeededCount: 0, failedCount: 0, details: [] };
+      const syncResultSummary = {
+        succeededCount: 0,
+        failedCount: 0,
+        details: [],
+      };
+      const pendingWhatsAppNotifications = [];
 
-      // استخدام حلقة تكرارية مرنة لمعالجة كل اشتراك على حدة لكي لا يتعطل كامل الطابور بسبب خطأ فردي
       for (const syncItem of subscriptionsArray) {
         try {
           const { studentId, items, offlineCreatedAt } = syncItem;
           const currentStudentId = Number(studentId);
 
           if (!currentStudentId || isNaN(currentStudentId)) {
-            throw new Error("رقم تعريف الطالب غير صالح أو مفقود");
+            throw new Error(
+              "رقم تعريف الطالب غير صالح أو مفقود في ملف الأوفلاين المرفوع.",
+            );
           }
 
-          const subscriptionActionDate = offlineCreatedAt ? new Date(offlineCreatedAt) : new Date();
+          const subscriptionActionDate = offlineCreatedAt
+            ? new Date(offlineCreatedAt)
+            : new Date();
 
-          // جلب الطالب والتحقق من تبعيته للمركز الحالي
           const student = await prisma.student.findFirst({
             where: { id: currentStudentId, centerId },
             include: {
@@ -408,27 +597,47 @@ router.post(
           });
 
           if (!student) {
-            throw new Error("الطالب المذكور غير موجود بالنظام أو لا ينتمي لهذا السنتر");
+            throw new Error(
+              "الطالب المذكور غير موجود بالنظام أو لا ينتمي لصلاحيات هذا السنتر.",
+            );
+          }
+
+          const validStages = ["PRIMARY", "MIDDLE", "HIGH"];
+          const studentStageEnum = validStages.includes(
+            student.stage?.toUpperCase(),
+          )
+            ? student.stage.toUpperCase()
+            : null;
+
+          if (!studentStageEnum) {
+            throw new Error(
+              `المرحلة الدراسية للطالب (${student.stage}) غير متوافقة مع النظام السحابي.`,
+            );
           }
 
           const activeSub = student.subscriptions[0];
 
-          await prisma.$transaction(async (tx) => {
+          // معالجة حركة البيانات المالية الفردية داخل الدفعة المجمعة بواسطة ميكانيزم الـ Transaction المنعزل والمحدث بالكامل
+          const transactionResult = await prisma.$transaction(async (tx) => {
             let totalPrice = 0;
             const processedItems = [];
             let globalSubType = "MONTHLY";
+            let finalTotalSessions = null;
+            let finalDurationMonths = null;
+            const perSessionData = [];
 
-            // في حالة التجديد التلقائي (المصفوفة فارغة)
+            // [الحالة 1]: التجديد التلقائي للأوفلاين (المصفوفة فارغة)
             if (!items || items.length === 0) {
               if (!activeSub) {
-                throw new Error("لا يوجد اشتراك سابق للتجديد التلقائي؛ يرجى تمرير مجموعات صالحة.");
+                throw new Error(
+                  "لا يوجد اشتراك سابق للتجديد التلقائي؛ يرجى تمرير مجموعات صالحة.",
+                );
               }
 
               globalSubType = activeSub.subscriptionType;
-              // جلب بنود الاشتراك القديمة
               const oldItems = await tx.subscriptionItem.findMany({
                 where: { subscriptionId: activeSub.id },
-                include: { session: true }
+                include: { session: true },
               });
 
               for (const oldItem of oldItems) {
@@ -436,72 +645,148 @@ router.post(
                 const priceRecord = await tx.priceConfiguration.findFirst({
                   where: {
                     teacherId: oldItem.session.teacherId,
-                    stage: student.stage,
+                    stage: studentStageEnum,
                     subscriptionType: globalSubType,
                     grades: { has: student.grade },
                   },
                 });
 
-                if (!priceRecord) throw new Error(`إعدادات التسعير مفقودة للمدرس المعني في نظام السنتر.`);
+                if (!priceRecord)
+                  throw new Error(
+                    `إعدادات التسعير وحزم المدرس مفقودة للتجديد التلقائي في السنتر.`,
+                  );
                 totalPrice += priceRecord.price;
-                processedItems.push({ sessionId: oldItem.sessionId, priceSnapshot: priceRecord.price });
+                processedItems.push({
+                  sessionId: oldItem.sessionId,
+                  priceSnapshot: priceRecord.price,
+                });
+
+                if (
+                  globalSubType === "PER_SESSION" &&
+                  priceRecord.totalSessions
+                ) {
+                  finalTotalSessions =
+                    (finalTotalSessions || 0) + priceRecord.totalSessions;
+                  perSessionData.push({
+                    days: oldItem.session.days,
+                    totalSessions: priceRecord.totalSessions,
+                  });
+                }
+                if (globalSubType === "COURSE" && priceRecord.durationMonths) {
+                  finalDurationMonths = Math.max(
+                    finalDurationMonths || 0,
+                    priceRecord.durationMonths,
+                  );
+                }
               }
 
-              const newEndDate = calculateEndDate(globalSubType, activeSub.endDate, 1, subscriptionActionDate);
+              const newEndDate = calculateEndDate(
+                globalSubType,
+                activeSub.endDate,
+                finalDurationMonths || 1,
+                subscriptionActionDate,
+                perSessionData,
+              );
 
-              await tx.subscriptionItem.deleteMany({ where: { subscriptionId: activeSub.id } });
-              await tx.subscription.update({
+              await tx.subscriptionItem.deleteMany({
+                where: { subscriptionId: activeSub.id },
+              });
+
+              let updatedSub = await tx.subscription.update({
                 where: { id: activeSub.id },
                 data: {
                   startDate: subscriptionActionDate,
                   endDate: newEndDate,
                   totalPrice,
                   status: "ACTIVE",
+                  totalSessions: finalTotalSessions
+                    ? (activeSub.totalSessions || 0) + finalTotalSessions
+                    : activeSub.totalSessions,
+                  durationMonths:
+                    finalDurationMonths || activeSub.durationMonths,
                   updatedAt: new Date(),
-                }
+                },
               });
 
               await tx.subscriptionItem.createMany({
-                data: processedItems.map(i => ({
-                  subscriptionId: activeSub.id,
+                data: processedItems.map((i) => ({
+                  subscriptionId: updatedSub.id,
                   sessionId: i.sessionId,
-                  priceSnapshot: i.priceSnapshot
-                }))
+                  priceSnapshot: i.priceSnapshot,
+                })),
               });
 
+              return updatedSub;
             } else {
-              // في حالة باقة مخصصة أو تعديل مجموعات
-              const uniqueSessionIds = [...new Set(items.map(i => Number(i.sessionId)))];
+              // [الحالة 2]: باقة مخصصة جديدة أو تعديل مجموعات الطلاب في وضع الأوفلاين الجماعي المجمع
+              const uniqueSessionIds = [
+                ...new Set(items.map((i) => Number(i.sessionId))),
+              ];
               globalSubType = items[0].subscriptionType || "MONTHLY";
 
               for (const sId of uniqueSessionIds) {
                 const session = await tx.session.findUnique({
                   where: { id: sId },
-                  include: { teacher: true }
+                  include: { teacher: true },
                 });
 
-                if (!session) throw new Error(`المجموعة رقم (${sId}) غير موجودة بالنظام.`);
+                if (!session)
+                  throw new Error(
+                    `المجموعة رقم (${sId}) المرفوعة أوفلاين غير موجودة بقاعدة البيانات السحابية.`,
+                  );
 
                 const priceRecord = await tx.priceConfiguration.findFirst({
                   where: {
                     teacherId: session.teacherId,
-                    stage: student.stage,
+                    stage: studentStageEnum,
                     subscriptionType: globalSubType,
-                    grades: { has: student.grade }
-                  }
+                    grades: { has: student.grade },
+                  },
                 });
 
-                if (!priceRecord) throw new Error(`لا يوجد تسعير متوافق للمدرس ${session.teacher?.name || ""}.`);
+                if (!priceRecord)
+                  throw new Error(
+                    `لا يوجد تسعير متوافق مسجل للمدرس ${session.teacher?.name || ""} لهذه المرحلة.`,
+                  );
                 totalPrice += priceRecord.price;
-                processedItems.push({ sessionId: sId, priceSnapshot: priceRecord.price });
+                processedItems.push({
+                  sessionId: sId,
+                  priceSnapshot: priceRecord.price,
+                });
+
+                if (
+                  globalSubType === "PER_SESSION" &&
+                  priceRecord.totalSessions
+                ) {
+                  finalTotalSessions =
+                    (finalTotalSessions || 0) + priceRecord.totalSessions;
+                  perSessionData.push({
+                    days: session.days,
+                    totalSessions: priceRecord.totalSessions,
+                  });
+                }
+                if (globalSubType === "COURSE" && priceRecord.durationMonths) {
+                  finalDurationMonths = Math.max(
+                    finalDurationMonths || 0,
+                    priceRecord.durationMonths,
+                  );
+                }
               }
 
-              const newEndDate = calculateEndDate(globalSubType, activeSub?.endDate, 1, subscriptionActionDate);
+              const newEndDate = calculateEndDate(
+                globalSubType,
+                activeSub?.endDate,
+                finalDurationMonths || 1,
+                subscriptionActionDate,
+                perSessionData,
+              );
 
-              let subId = activeSub?.id;
+              let finalSub;
               if (activeSub) {
-                await tx.subscriptionItem.deleteMany({ where: { subscriptionId: activeSub.id } });
-                await tx.subscription.update({
+                await tx.subscriptionItem.deleteMany({
+                  where: { subscriptionId: activeSub.id },
+                });
+                finalSub = await tx.subscription.update({
                   where: { id: activeSub.id },
                   data: {
                     subscriptionType: globalSubType,
@@ -509,11 +794,14 @@ router.post(
                     startDate: subscriptionActionDate,
                     endDate: newEndDate,
                     status: "ACTIVE",
-                    updatedAt: new Date()
-                  }
+                    totalSessions: finalTotalSessions,
+                    usedSessions: 0,
+                    durationMonths: finalDurationMonths,
+                    updatedAt: new Date(),
+                  },
                 });
               } else {
-                const newSub = await tx.subscription.create({
+                finalSub = await tx.subscription.create({
                   data: {
                     studentId: currentStudentId,
                     startDate: subscriptionActionDate,
@@ -521,73 +809,141 @@ router.post(
                     subscriptionType: globalSubType,
                     totalPrice,
                     status: "ACTIVE",
+                    totalSessions: finalTotalSessions,
+                    usedSessions: 0,
+                    durationMonths: finalDurationMonths,
                     createdBy: userId,
-                    createdAt: subscriptionActionDate
-                  }
+                    createdAt: subscriptionActionDate,
+                  },
                 });
-                subId = newSub.id;
               }
 
               await tx.subscriptionItem.createMany({
-                data: processedItems.map(i => ({
-                  subscriptionId: subId,
+                data: processedItems.map((i) => ({
+                  subscriptionId: finalSub.id,
                   sessionId: i.sessionId,
-                  priceSnapshot: i.priceSnapshot
-                }))
+                  priceSnapshot: i.priceSnapshot,
+                })),
               });
-            }
 
-            // تدوين لوج المزامنة بنجاح
-            await tx.activityLog.create({
-              data: {
-                centerId,
-                userId,
-                action: "BULK_OFFLINE_SUBSCRIPTION_SYNC",
-                targetType: "Subscription",
-                targetId: activeSub ? activeSub.id : 0,
-                createdAt: new Date(),
-                details: JSON.stringify({ studentId: currentStudentId, totalPrice })
-              }
-            });
+              return finalSub;
+            }
           });
 
-          // إرسال تنبيه واتساب فوري في الخلفية
-          safeSendWhatsApp(currentStudentId, "FIRST_SUB").catch(() => {});
+          // إعادة جلب شاملة لملء بيانات الـ Relations لضمان وصولها كاملة للواتساب والملخص النهائي للدفعة المزامنة
+          const fullResultWithRelations = await prisma.subscription.findUnique({
+            where: { id: transactionResult.id },
+            include: {
+              items: { include: { session: true } },
+            },
+          });
+
+          await prisma.activityLog.create({
+            data: {
+              centerId,
+              userId,
+              action: "BULK_OFFLINE_SUBSCRIPTION_SYNC_ITEM",
+              targetType: "Subscription",
+              targetId: fullResultWithRelations.id,
+              createdAt: new Date(),
+              details: JSON.stringify({
+                studentId: currentStudentId,
+                totalPrice: fullResultWithRelations.totalPrice,
+                durationMonths: fullResultWithRelations.durationMonths,
+              }),
+            },
+          });
+
+          // إضافة كائن التنبيه المحسن لشريط الإرسال الخلفي بالواتساب
+          pendingWhatsAppNotifications.push({
+            studentId: currentStudentId,
+            payload: {
+              subscriptionId: fullResultWithRelations.id,
+              studentName: student.name,
+              subscriptionType: fullResultWithRelations.subscriptionType,
+              totalPrice: fullResultWithRelations.totalPrice,
+              endDate: fullResultWithRelations.endDate,
+              durationMonths: fullResultWithRelations.durationMonths, // إطلاق المدة بالشهور فورياً 🚀
+              totalSessions: fullResultWithRelations.totalSessions,
+              isBulkSynced: true,
+              groups: fullResultWithRelations.items.map(
+                (i) => i.session?.name || "غير محدد",
+              ),
+            },
+          });
 
           syncResultSummary.succeededCount++;
-          syncResultSummary.details.push({ studentId: currentStudentId, status: "SUCCESS" });
+          syncResultSummary.details.push({
+            studentId: currentStudentId,
+            status: "SUCCESS",
+            subscriptionId: fullResultWithRelations.id,
+            durationMonths: fullResultWithRelations.durationMonths,
+            totalSessions: fullResultWithRelations.totalSessions,
+          });
         } catch (individualError) {
           syncResultSummary.failedCount++;
           syncResultSummary.details.push({
             studentId: syncItem.studentId || "غير محدد",
             status: "FAILED",
-            reason: individualError.message
+            reason: individualError.message,
           });
         }
       }
 
-      return res.status(200).json({
-        success: true,
-        message: `تمت معالجة الدفعة الأوفلاين المجمعة بنجاح. الناجحة: ${syncResultSummary.succeededCount}، الفاشلة: ${syncResultSummary.failedCount}`,
-        summary: syncResultSummary
+      // إرسال كتل رسائل الواتساب في الخلفية بأمان تام 🚀
+      if (pendingWhatsAppNotifications.length > 0) {
+        pendingWhatsAppNotifications.forEach((notifyItem) => {
+          safeSendWhatsApp(
+            notifyItem.studentId,
+            "FIRST_SUB",
+            notifyItem.payload,
+          ).catch((err) => {
+            console.error(
+              `🚨 [BULK SYNC WHATSAPP THREAD ERROR] للطالب ${notifyItem.studentId}:`,
+              err.message,
+            );
+          });
+        });
+      }
+
+      await prisma.activityLog.create({
+        data: {
+          centerId,
+          userId,
+          action: "BULK_OFFLINE_SUBSCRIPTION_SYNC_COMPLETED",
+          targetType: "BulkJob",
+          createdAt: new Date(),
+          details: JSON.stringify({
+            totalProcessed: subscriptionsArray.length,
+            successCount: syncResultSummary.succeededCount,
+            failCount: syncResultSummary.failedCount,
+          }),
+        },
       });
 
+      return res.status(200).json({
+        success: true,
+        message: `تمت معالجة ومزامنة الدفعة الأوفلاين المجمعة بنجاح مالي وتحديث للمدد والكورسات. الناجحة: ${syncResultSummary.succeededCount}، الفاشلة: ${syncResultSummary.failedCount} 🎉⚡`,
+        summary: syncResultSummary,
+      });
     } catch (criticalError) {
       console.error("❌ Critical Subscription Bulk-Sync Error:", criticalError);
-      return res.status(500).json({ error: "انهيار داخلي أثناء معالجة حزمة المزامنة المجمعة للاشتراكات" });
+      return res.status(500).json({
+        error:
+          "انهيار داخلي في السيرفر أثناء معالجة حزمة المزامنة المجمعة للاشتراكات",
+      });
     }
-  }
+  },
 );
 
 // =============================================
-// 2️⃣ GET /api/subscriptions - عرض وتصفية جميع اشتراكات السنتر (ADMIN, SECRETARY)
+// 2️⃣ GET /api/subscriptions - عرض وتصفية جميع اشتراكات السنتر بدقة وهندسة عرض مسطحة لسهولة القراءة بالفرونت إند
 // =============================================
 router.get("/", authenticateToken, requireCenterAccess, async (req, res) => {
   try {
     const { centerId } = req.user;
     const { status } = req.query;
 
-    // جلب الاشتراكات المفلترة مع دمج بيانات الطلاب ومجموعات الحصص ومدرسيها
     const subscriptions = await prisma.subscription.findMany({
       where: {
         student: { centerId },
@@ -612,7 +968,6 @@ router.get("/", authenticateToken, requireCenterAccess, async (req, res) => {
       orderBy: { updatedAt: "desc" },
     });
 
-    // معالجة البيانات وإعادتها بشكل مسطح وثابت (Flat Structure) لراحة وعرض جداول الفرونت إند
     const formattedData = subscriptions.map((sub) => ({
       id: sub.id,
       studentId: sub.student?.id,
@@ -625,9 +980,12 @@ router.get("/", authenticateToken, requireCenterAccess, async (req, res) => {
       totalPrice: sub.totalPrice,
       status: sub.status,
       subscriptionType: sub.subscriptionType,
+      totalSessions: sub.totalSessions,
+      usedSessions: sub.usedSessions,
+      durationMonths: sub.durationMonths, // تسطيح حقل المدة بالشهور لعرضه فورياً ⚡
       activeGroups: sub.items.map((i) => ({
         sessionId: i.sessionId,
-        sessionName: i.session?.name || "مجموعة محذوفة",
+        sessionName: i.session?.name || "مجموعة محذوفة من النظام",
         teacherName: i.session?.teacher?.name || "غير محدد",
         subject: i.session?.teacher?.subject || "",
         price: i.priceSnapshot,
@@ -641,11 +999,10 @@ router.get("/", authenticateToken, requireCenterAccess, async (req, res) => {
     });
   } catch (error) {
     console.error("❌ Fetch Subscriptions Error:", error);
-    return res
-      .status(500)
-      .json({
-        error: "حصل خطأ داخلي أثناء جلب ومعالجة البيانات المالية للاشتراكات",
-      });
+    return res.status(500).json({
+      error:
+        "حصل خطأ داخلي هندسي أثناء جلب ومعالجة البيانات المالية للاشتراكات والتحقق من التراخيص السحابية",
+    });
   }
 });
 

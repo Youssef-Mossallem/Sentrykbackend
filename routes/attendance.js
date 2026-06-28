@@ -1852,5 +1852,157 @@ router.post(
     }
   }
 );
+// attendance.js - الراوت المخصص والمطور لتسجيل الحضور اليدوي (بدون كارت أو QR)
+router.post(
+  "/mark-attendance",
+  authenticateToken,
+  requireActiveSubscription,
+  requireRole(["ADMIN", "SECRETARY"]),
+  requireCenterAccess,
+  async (req, res) => {
+    const { centerId, userId } = req.user;
+    
+    // تحويل المدخلات لبيانات رقمية ونصوص معالجة لضمان سلامة الاستعلام
+    const studentId = Number(req.body.studentId);
+    const sessionId = Number(req.body.sessionId);
+    const status = req.body.status ? req.body.status.toUpperCase() : "PRESENT";
+    const lateMinutes = req.body.lateMinutes !== undefined ? Number(req.body.lateMinutes) : 0;
 
+    // 1. صمام الأمان الأول: التحقق الصارم من اكتمال وصلاحية حقول الطلب الجوهرية
+    if (isNaN(studentId) || studentId <= 0 || isNaN(sessionId) || sessionId <= 0) {
+      console.warn(`⚠️ [Manual Attendance Bad Request]: محاولة إدخال بيانات تالفة أو ناقصة من المستخدم [${userId}]`);
+      return res.status(400).json({ 
+        success: false, 
+        error: "فشل معالجة الطلب: يجب تزويد النظام بمعرف الطالب ومعرف الحصة بشكل رقمي صحيح." 
+      });
+    }
+
+    if (!["PRESENT", "LATE", "ABSENT"].includes(status)) {
+      return res.status(400).json({ 
+        success: false, 
+        error: "فشل المعالجة: حالة الحضور المرسلة غير مطابقة للقيم المعتمدة بالنظام (PRESENT, LATE, ABSENT)." 
+      });
+    }
+
+    console.log(
+      `📝 [Manual Attendance Request]: تسجيل حضور يدوي للطالب [${studentId}] بحصة [${sessionId}] - الحالة: [${status}] من المستخدم: [${userId}]`
+    );
+
+    try {
+      // 2. تنفيذ العملية داخل معاملة ذرية معزولة (Atomic Transaction) لضمان سلامة واتساق البيانات
+      const result = await prisma.$transaction(async (tx) => {
+        
+        // أ. التحقق الأمني من وجود الطالب وتبعيته المطلقة للسنتر الحالي (Cross-Tenant Protection)
+        const studentExists = await tx.student.findFirst({
+          where: { id: studentId, centerId: Number(centerId) }
+        });
+        if (!studentExists) {
+          throw new Error("عذراً، الطالب غير مسجل بسجلات هذا المركز التعليمي أو تم حذفه.");
+        }
+
+        // ب. التحقق الأمني من الحصة وتبعية المدرس الخاص بها للسنتر الحالي لقطع الطريق على أي تلاعب بالـ IDs
+        const sessionExists = await tx.session.findFirst({
+          where: { 
+            id: sessionId,
+            teacher: { centerId: Number(centerId) }
+          }
+        });
+        if (!sessionExists) {
+          throw new Error("عذراً، الحصة المطلوبة غير موجودة أو لا تنتمي لصلاحيات هذا المركز.");
+        }
+
+        // ج. جلب مفتاح التاريخ الخاص بتوقيت القاهرة (Cairo Date Key) لضمان استقرار النوافذ اليومية
+        const todayKey = typeof getCairoDateKey === "function" 
+          ? getCairoDateKey(new Date()) 
+          : new Date(new Date().setHours(0, 0, 0, 0));
+
+        // د. فحص أو إنشاء نافذة الحضور التاريخية للحصة في اليوم الحالي (SessionAttendanceWindow)
+        let window = await tx.sessionAttendanceWindow.findUnique({
+          where: { sessionId_date: { sessionId, date: todayKey } }
+        });
+
+        if (!window) {
+          console.log(`⚙️ [Attendance Window]: لم يتم العثور على نافذة مفتوحة للحصة [${sessionId}] اليوم، جاري توليدها تلقائياً...`);
+          window = await tx.sessionAttendanceWindow.create({
+            data: { 
+              sessionId, 
+              date: todayKey, 
+              openedAt: new Date(), 
+              isClosed: false,
+              autoCloseMinutes: 120 // وقت افتراضي مرن لإغلاق النافذة الذاتية
+            }
+          });
+        }
+
+        // هـ. فحص سجل الحضور السابق للوقوف على التغييرات وتوثيقها بدقة بملف النشاطات
+        const existingAttendance = await tx.attendance.findUnique({
+          where: { studentId_windowId: { studentId, windowId: window.id } }
+        });
+
+        // و. دمج وظيفة الـ Upsert الذكية لحقن الحضور الجديد أو تعديل القديم فوراً لمنع أخطاء الـ Unique Constraints
+        const normalizedStatus = typeof normalizeAttendanceStatus === "function"
+          ? normalizeAttendanceStatus(status)
+          : status;
+
+        const updatedAttendance = await tx.attendance.upsert({
+          where: { studentId_windowId: { studentId, windowId: window.id } },
+          update: {
+            status: normalizedStatus,
+            lateMinutes: normalizedStatus === "LATE" ? lateMinutes : 0,
+            markedAt: new Date(),
+            autoMarked: false,
+            markedBySystem: false,
+          },
+          create: {
+            studentId,
+            sessionId,
+            windowId: window.id,
+            centerId: Number(centerId),
+            status: normalizedStatus,
+            lateMinutes: normalizedStatus === "LATE" ? lateMinutes : 0,
+            scannedAt: new Date(),
+            markedAt: new Date(),
+            autoMarked: false,
+            markedBySystem: false,
+          },
+        });
+
+        // ز. توثيق العملية الحالية بجدول مراقبة النشاطات (Audit Trail Log) لمعرفة من قام بالتحضير اليدوي
+        await tx.activityLog.create({
+          data: {
+            centerId: Number(centerId),
+            userId: Number(userId),
+            action: "MANUAL_ATTENDANCE_MARK",
+            targetType: "Attendance",
+            targetId: updatedAttendance.id,
+            details: JSON.stringify({
+              studentName: studentExists.name,
+              sessionName: sessionExists.name,
+              statusBefore: existingAttendance ? existingAttendance.status : "NONE",
+              statusAfter: normalizedStatus,
+              lateMinutes: normalizedStatus === "LATE" ? lateMinutes : 0,
+              ipRequest: req.ip || "UNKNOWN"
+            }),
+          },
+        });
+
+        return updatedAttendance;
+      });
+
+      console.log(`✅ [Manual Attendance Success]: تم إثبات الحضور اليدوي بنجاح للطالب ID: [${studentId}]`);
+      return res.json({ 
+        success: true, 
+        message: "تم تسجيل وتحديث حالة حضور الطالب يدوياً بنجاح استراتيجي تام بالخادم ✅",
+        data: result
+      });
+
+    } catch (error) {
+      console.error(`❌ Manual Attendance Critical Error:`, error);
+      return res.status(400).json({ 
+        success: false, 
+        error: error.message || "فشل معالجة خطوة التحضير اليدوي بالسيرفر" 
+      });
+    }
+  }
+);
 module.exports = router;
