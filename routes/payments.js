@@ -2353,7 +2353,7 @@ router.post(
           return_url: `${process.env.FRONTEND_URL}/checkout`,
           amount: amountInCents,
           currency: "EGP",
-          payment_methods: [5589224],
+          payment_methods: [5589224,5603776],
           merchant_order_id: merchantReference,
           items: [
             {
