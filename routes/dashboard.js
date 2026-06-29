@@ -313,7 +313,7 @@ router.get("/", authenticateToken, requireCenterAccess, async (req, res) => {
           id: log.id,
           time: log.createdAt
             ? new Date(log.createdAt).toLocaleString("ar-EG", {
-                timeZone: "America/Tijuana",
+                timeZone: "Africa/Cairo",
               })
             : null,
           user: log.user?.name || "النظام الآلي",
