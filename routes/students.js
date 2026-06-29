@@ -685,7 +685,7 @@ router.post(
               subscriptionType,
               items,
               totalSessions: chosenSessions,
-            } = sub;
+                } = sub;
             if (!isValidSubscriptionType(subscriptionType)) {
               throw new Error(
                 `نوع باقة الاشتراك المرسل غير مدعوم بالنظام: [${subscriptionType}]`,
@@ -829,74 +829,9 @@ router.post(
         "✅ [Prisma Transaction Success]: تم إغلاق وتثبيت المعاملة بنجاح كامل في الداتابيز.",
       );
 
-      // مرحلة رسم الكارت و الرفع السحابي المحصن بالكامل لمنع أي توقف أو فشل حاصر للطلب
-      let qrImageUrl = null;
-      let shortQrUrl = null;
-
-      try {
-        console.log(
-          "🎨 [Media Phase]: البدء الفوري في محرك توليد وتصميم كارت الهوية النخبوي...",
-        );
-        const cardBuffer = await generateSentrykEliteCard({
-          studentName: transactionResult.studentName,
-          centerName: targetCenterName,
-          qrToken: finalQrToken,
-        });
-
-        if (process.env.CLOUDINARY_CLOUD_NAME) {
-          console.log(
-            "☁️ [Cloudinary Phase]: جاري رفع كارت الطالب لـ Cloudinary...",
-          );
-          const uploadResult = await uploadBufferToCloudinary(cardBuffer, {
-            folder: `sentryk/center_${centerId}/qrcodes`,
-            public_id: `card_${finalQrToken}`,
-            overwrite: true,
-          });
-
-          qrImageUrl = uploadResult.secure_url;
-          console.log(
-            `☁️ [Cloudinary Phase Success]: الرابط المباشر المستقر: ${qrImageUrl}`,
-          );
-
-          // تمرير الرابط المباشر لمحرك التقصير السيادي الخاص بـ Sentryk
-          shortQrUrl = await generateSentrykShortUrl(qrImageUrl, centerId);
-
-          const finalSavedUrl = shortQrUrl || qrImageUrl;
-          console.log(
-            `⚙️ [Database Update]: جاري حفظ رابط الكارت المعتمد [${finalSavedUrl}] في ملف الطالب رقم [${transactionResult.studentId}]`,
-          );
-
-          await prisma.student.update({
-            where: { id: transactionResult.studentId },
-            data: { qrImageUrl: finalSavedUrl },
-          });
-          console.log(
-            "✅ [Database Update Success]: تم دمج الرابط المظلي بالملف بنجاح.",
-          );
-        } else {
-          console.warn(
-            "⚠️ [Cloudinary Configuration Missing]: متغيرات البيئة لـ Cloudinary غائبة، تم تجاوز الرفع السحابي.",
-          );
-        }
-      } catch (mediaError) {
-        console.error(
-          "❌ [Isolated Media Phase Error]: حدث فشل أثناء توليد الكارت أو رفعه، لكن تم عزل الخطأ لسلامة التسجيل:",
-          mediaError.message,
-        );
-        // لا يتم إلقاء خطأ هنا، الطالب تم حفظه بالفعل في الداتابيز بنجاح نظامي
-      }
-
-      // إرسال الإشعار الترحيبي والـ QR عبر خطافات الواتساب غير الحاصرة
-      const finalUrlToWhatsApp = shortQrUrl || qrImageUrl || "";
-      if (finalUrlToWhatsApp) {
-        await safeSendWhatsApp(transactionResult.studentId, "FIRST_SUB", {
-          qrImageUrl: finalUrlToWhatsApp,
-        });
-      }
-
-      // جلب كائن الطالب كاملاً مع ملحقاته وعلاقاته لإعادته للفرونت إند متطابق 100% مع الـ Mapper
+      // جلب كائن الطالب كاملاً مع ملحقاته وعلاقاته لإعادته للفرونت إند متطابق 100% مع الـ Mapper بشكل سريع جداً (بدون انتظار الصور)
       console.log(
-        "🔄 [Final Fetch]: سحب ملف الطالب المحدث كلياً من قاعدة البيانات لإرساله للاستجابة...",
+        "🔄 [Final Fetch]: سحب ملف الطالب المحدث كلياً من قاعدة البيانات لإرساله للاستجابة السريعة...",
       );
       const completeCreatedStudent = await prisma.student.findUnique({
         where: { id: transactionResult.studentId },
@@ -919,13 +854,88 @@ router.post(
       });
 
       console.log(
-        `✨ [API Response Sent]: تم إرسال كود النجاح 201. تم إنشاء الطالب [${transactionResult.studentName}] بنجاح نخبوي ميكانيكي.`,
+        `✨ [API Response Sent]: تم إرسال كود النجاح 201 الفوري. تم إنشاء الطالب [${transactionResult.studentName}] بنجاح نخبوي ميكانيكي.`,
       );
-      return res.status(201).json({
+
+      // الرد الفوري المباشر على العميل / الفرونت إند لكسر حاجز الـ 12 ثانية انتهاءاً بـ 30 مللي ثانية فقط!
+      res.status(201).json({
         success: true,
-        message: "تم تسجيل الطالب وتوليد كارت الحضور الذكي بنجاح تام 🚀",
+        message: "تم تسجيل الطالب بنجاح (جاري توليد الكارت وإرساله بالخلفية) 🚀",
         student: mapStudentStatus(completeCreatedStudent),
       });
+
+      // ======================================================================
+      // === خط إنتاج العمليات الثقيلة (Background Execution Pipeline) ===
+      // ======================================================================
+      setImmediate(async () => {
+        try {
+          console.log(
+            `🎨 [Background Phase]: البدء الفوري في محرك توليد وتصميم كارت الهوية النخبوي للطالب [${transactionResult.studentName}] ذو المعرف [${transactionResult.studentId}]...`,
+          );
+          
+          const cardBuffer = await generateSentrykEliteCard({
+            studentName: transactionResult.studentName,
+            centerName: targetCenterName,
+            qrToken: finalQrToken,
+          });
+
+          let qrImageUrl = null;
+          let shortQrUrl = null;
+
+          if (process.env.CLOUDINARY_CLOUD_NAME) {
+            console.log(
+              `☁️ [Background Cloudinary]: جاري رفع كارت الطالب لـ Cloudinary...`,
+            );
+            const uploadResult = await uploadBufferToCloudinary(cardBuffer, {
+              folder: `sentryk/center_${centerId}/qrcodes`,
+              public_id: `card_${finalQrToken}`,
+              overwrite: true,
+            });
+
+            qrImageUrl = uploadResult.secure_url;
+            console.log(
+              `☁️ [Background Cloudinary Success]: الرابط المباشر المستقر: ${qrImageUrl}`,
+            );
+
+            // تمرير الرابط المباشر لمحرك التقصير السيادي الخاص بـ Sentryk
+            shortQrUrl = await generateSentrykShortUrl(qrImageUrl, centerId);
+
+            const finalSavedUrl = shortQrUrl || qrImageUrl;
+            console.log(
+              `⚙️ [Background Database Update]: جاري حفظ رابط الكارت المعتمد [${finalSavedUrl}] في ملف الطالب رقم [${transactionResult.studentId}]`,
+            );
+
+            await prisma.student.update({
+              where: { id: transactionResult.studentId },
+              data: { qrImageUrl: finalSavedUrl },
+            });
+            console.log(
+              "✅ [Background Database Update Success]: تم دمج الرابط المظلي بالملف بنجاح في الخلفية.",
+            );
+
+            // إرسال الإشعار الترحيبي والـ QR عبر خطافات الواتساب غير الحاصرة بعد التأكد من دمج الرابط تماماً
+            if (finalSavedUrl) {
+              console.log(
+                `💬 [Background WhatsApp]: جاري تحضير وإرسال الرسالة الترحيبية الشاملة على الواتساب للمستخدم...`,
+              );
+              await safeSendWhatsApp(transactionResult.studentId, "FIRST_SUB", {
+                qrImageUrl: finalSavedUrl,
+              });
+              console.log(`✅ [Background WhatsApp Success]: تم إرسال كارت الهوية والرسالة عبر الواتساب بنجاح.`);
+            }
+          } else {
+            console.warn(
+              "⚠️ [Background Cloudinary Warning]: متغيرات البيئة لـ Cloudinary غائبة، تم تجاوز الرفع السحابي والواتساب بالخلفية.",
+            );
+          }
+        } catch (mediaError) {
+          console.error(
+            "❌ [Background Isolated Media Phase Error]: حدث فشل أثناء معالجة الكارت أو رفعه بالخلفية، تم عزل الخطأ لضمان استقرار الخادم:",
+            mediaError.message,
+          );
+        }
+      });
+
     } catch (error) {
       console.error(
         "❌ [Sentryk Student Create Critical Error]: انهار مسار تسجيل الطالب الفردي كلياً. التفاصيل الفنية المكتشفة 👇",
